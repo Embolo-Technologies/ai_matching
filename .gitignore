@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+venv_win/
+.venv/
+env/
+ENV/
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Executables and Binaries
+fast_search_server
+fast_search_server.exe
+*.exe
+*.o
+*.so
+*.dylib
+
+# Large Model Files
+models/
+*.gguf
+
+# Databases and cache databases
+*.db
+qwen3_engine/cache.db
+
+# Data files (CSV/Excel)
+*.csv
+*.xlsx
+*.xls
+Item_export_2026-05-29_17-33-30.csv
