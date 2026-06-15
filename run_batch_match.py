@@ -92,7 +92,7 @@ def classify_confidence(score):
 def main():
     parser = argparse.ArgumentParser(description="Full production matching run")
     parser.add_argument("--limit", type=int, default=0, help="Limit items (0=all)")
-    parser.add_argument("--no-ai", action="store_true", default=True, help="Heuristic only (faster, defaults to True)")
+    parser.add_argument("--no-ai", action="store_true", default=False, help="Disable AI (heuristic only, faster but less accurate)")
     parser.add_argument("--master-xlsx", default="/Volumes/ssd embolo/Games/masterdata.xlsx")
     parser.add_argument("--input-xlsx", default="/Volumes/ssd embolo/Games/input.xlsx")
     parser.add_argument("--output-xlsx", default="/Volumes/ssd embolo/Games/full_matching_results.xlsx")
@@ -100,13 +100,32 @@ def main():
 
     print("=" * 80)
     print("FULL PRODUCTION MATCHING RUN")
-    print(f"AI Fallback: {'OFF (heuristic only)' if args.no_ai else 'ON'}")
+    print(f"AI Matching: {'OFF (heuristic only)' if args.no_ai else 'ON — low confidence items will be AI matched'}")
     print("=" * 80)
 
     # 1. Load master catalog
     print(f"\n[1/4] Loading master catalog...")
     t0 = time.time()
-    df_master = pd.read_excel(args.master_xlsx)
+    if args.master_xlsx.endswith('.csv'):
+        df_master = pd.read_csv(args.master_xlsx)
+    else:
+        df_master = pd.read_excel(args.master_xlsx)
+
+    # Standardize column names for master database
+    rename_map = {
+        'Material Description': 'name',
+        'Brands': 'Compname',
+        'Pack Size Per Strip': 'Pack'
+    }
+    for old_col, new_col in rename_map.items():
+        if old_col in df_master.columns and new_col not in df_master.columns:
+            df_master = df_master.rename(columns={old_col: new_col})
+
+    # Ensure required columns exist
+    for col in ['name', 'Compname', 'Pack']:
+        if col not in df_master.columns:
+            df_master[col] = ""
+
     df_master = df_master.dropna(subset=['name'])
     df_master = df_master[~df_master['name'].astype(str).str.contains(r'^(name|----)$', case=False, na=False)]
     df_master['code'] = [f"M_{i}" for i in range(1, len(df_master) + 1)]
@@ -115,7 +134,8 @@ def main():
     df_master['Pack'] = df_master['Pack'].fillna("").astype(str).str.strip()
     df_master['name'] = df_master['name'].astype(str).str.strip()
 
-    temp_csv = "/Volumes/ssd embolo/Games/masterdata_converted.csv"
+    input_base = os.path.splitext(os.path.basename(args.input_xlsx))[0]
+    temp_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"masterdata_converted_{input_base}.csv")
     df_master[['code', 'name', 'Compname', 'Pack', 'strength']].to_csv(temp_csv, index=False, encoding='utf-8-sig')
     print(f"   ✓ {len(df_master):,} master items loaded in {time.time()-t0:.1f}s")
 
@@ -129,7 +149,10 @@ def main():
 
     # 3. Load input
     print(f"\n[3/4] Loading chemist input...")
-    df_input = pd.read_excel(args.input_xlsx)
+    if args.input_xlsx.endswith('.csv'):
+        df_input = pd.read_csv(args.input_xlsx)
+    else:
+        df_input = pd.read_excel(args.input_xlsx)
     df_input = df_input.dropna(subset=['name'])
     df_input = df_input[~df_input['name'].astype(str).str.contains(r'^(name|----)$', case=False, na=False)]
     
@@ -141,6 +164,7 @@ def main():
     print(f"\n[4/4] Running matches on {len(df_input):,} items...")
     results = []
     matched_count = 0
+    matched_master_codes = set()  # Track matched master codes for 1:1 deduplication
     t_start = time.time()
     total = len(df_input)
 
@@ -155,50 +179,82 @@ def main():
         
         query_str = f"{q_name} {q_pack}".strip()
 
-        # Run match (heuristic-only for speed on full run)
         t0q = time.time()
-        candidates_res, _ = searcher.search(q_name, pack=q_pack, top_k=5)
-        candidates = [{
-            "code": r["code"], "name": r["name"], "brand": r["compname"],
-            "pack": r["pack"], "strength": r["strength"],
-        } for r in candidates_res]
+        candidates_res, _ = searcher.search(q_name, pack=q_pack, compname=q_comp, top_k=10)
+        
+        # Filter out already-matched master items (1:1 deduplication)
+        candidates = []
+        for r in candidates_res:
+            if r["code"] not in matched_master_codes:
+                candidates.append({
+                    "code": r["code"], "name": r["name"], "brand": r["compname"],
+                    "pack": r["pack"], "strength": r["strength"],
+                })
+        candidates = candidates[:5]  # Keep top 5 after dedup filtering
 
-        heur_result, heur_confidence = matcher.heuristic_match(query_str, candidates, name=q_name)
+        heur_result, heur_confidence = matcher.heuristic_match(query_str, candidates, name=q_name, compname=q_comp)
         
         if heur_result and heur_confidence >= 95:
+            # HIGH confidence — accept directly
             matched_item = heur_result
             match_method = "Heuristic"
-        elif heur_result and not args.no_ai:
-            # Medium confidence — AI verify
-            if matcher.ai_verify(query_str, heur_result, name=q_name):
-                matched_item = heur_result
-                match_method = "AI Verified"
-            else:
-                matched_item = None
-                match_method = "AI Rejected"
-        elif heur_result:
+        elif heur_result and heur_confidence >= 75:
+            # MEDIUM confidence — accept heuristic (good enough)
             matched_item = heur_result
-            match_method = "Heuristic (Low)"
-        else:
-            # No heuristic match — try AI fallback if enabled
-            if not args.no_ai and candidates:
-                ai_result = matcher.llm_rerank(query_str, candidates, name=q_name)
+            match_method = "Heuristic"
+        elif not args.no_ai and candidates:
+            # Pre-filter candidates by loose validation check to skip calling AI on complete mismatches
+            valid_candidates = []
+            for cand in candidates:
+                if matcher.validate_match(query_str, cand, name=q_name, compname=q_comp, strict=False):
+                    valid_candidates.append(cand)
+            
+            if not valid_candidates:
+                matched_item = None
+                match_method = "No Match"
+            else:
+                if heur_result:
+                    print(f"   [AI Match] '{q_name}' heuristic confidence={heur_confidence}% too low, sending to AI...")
+                else:
+                    print(f"   [AI Match] '{q_name}' no heuristic match, sending to AI...")
+                ai_result = matcher.llm_rerank(query_str, valid_candidates, name=q_name, compname=q_comp)
                 if ai_result:
                     matched_item = ai_result
                     match_method = "AI Match"
                 else:
                     matched_item = None
                     match_method = "No Match"
-            else:
-                matched_item = None
-                match_method = "No Match"
+        elif heur_result:
+            # AI disabled but we have a low-confidence heuristic — accept with warning
+            matched_item = heur_result
+            match_method = "Heuristic (Low)"
+        else:
+            matched_item = None
+            match_method = "No Match"
 
         latency = (time.time() - t0q) * 1000
 
         if matched_item:
             matched_count += 1
+            matched_master_codes.add(matched_item['code'])  # Mark as used for dedup
             confidence = compute_confidence(q_name, matched_item['name'], matched_item.get('brand',''), q_pack, matched_item.get('pack',''))
             status = classify_confidence(confidence)
+            
+            # Company match status
+            comp_status = "—"
+            if q_comp and q_comp.strip() and q_comp.strip() != '--':
+                m_comp = matched_item.get('brand', '') or ''
+                if m_comp:
+                    from rapidfuzz import fuzz as _fuzz
+                    comp_sim = _fuzz.partial_ratio(q_comp.lower(), m_comp.lower())
+                    if comp_sim >= 60:
+                        comp_status = "✅ Match"
+                    elif comp_sim >= 35:
+                        comp_status = "⚠️ Partial"
+                    else:
+                        comp_status = "❌ Mismatch"
+                else:
+                    comp_status = "— No Master Co."
             
             results.append({
                 "Input Code": q_code,
@@ -213,6 +269,7 @@ def main():
                 " ": "",  # spacer column
                 "Confidence %": confidence,
                 "Status": status,
+                "Company Match": comp_status,
                 "Method": match_method,
                 "Time (ms)": round(latency, 1),
             })
@@ -230,6 +287,7 @@ def main():
                 " ": "",
                 "Confidence %": 0,
                 "Status": "— No Match Found",
+                "Company Match": "—",
                 "Method": match_method,
                 "Time (ms)": round(latency, 1),
             })
@@ -301,6 +359,12 @@ def main():
                         pass
                 ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
 
+    # Clean up unique temp CSV
+    try:
+        if os.path.exists(temp_csv):
+            os.remove(temp_csv)
+    except:
+        pass
     print(f"✓ Excel saved successfully!")
     print(f"{'='*80}")
 

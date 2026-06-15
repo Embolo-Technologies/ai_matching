@@ -96,12 +96,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         .search-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 2fr 1.2fr 1fr;
             gap: 20px;
             margin-bottom: 25px;
         }
 
-        @media (max-width: 600px) {
+        @media (max-width: 768px) {
             .search-grid {
                 grid-template-columns: 1fr;
             }
@@ -311,6 +311,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
             <div class="input-group">
+                <label for="company-input">Company (Optional)</label>
+                <div class="input-wrapper">
+                    <input type="text" id="company-input" placeholder="e.g. Wallace, Hetero, Serdia" autocomplete="off">
+                </div>
+            </div>
+            <div class="input-group">
                 <label for="pack-input">Pack Size (Optional)</label>
                 <div class="input-wrapper">
                     <input type="text" id="pack-input" placeholder="e.g. 10 TAB, 15 CAP, 1*10ML" autocomplete="off">
@@ -359,6 +365,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('catalog-status').textContent = `Local Catalog Loaded: ${CATALOG.length.toLocaleString()} medicines available offline.`;
 
         const nameInput = document.getElementById('name-input');
+        const companyInput = document.getElementById('company-input');
         const packInput = document.getElementById('pack-input');
         
         const matchCardContainer = document.getElementById('match-card-container');
@@ -427,8 +434,66 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             return (2.0 * intersection) / (bigrams1.size + bigrams2.size);
         }
 
+        // Clean company name
+        function cleanCompanyName(nameStr) {
+            if (!nameStr) return "";
+            nameStr = nameStr.toLowerCase().trim();
+            if (["", "--", "none", "null", "nan", "undefined", "unknown", "-"].includes(nameStr)) {
+                return "";
+            }
+            nameStr = nameStr.replace(/[^a-z0-9\\s]/g, ' ');
+            const stopwords = new Set([
+                'laboratories', 'laboratory', 'labs', 'lab', 'pharma', 'pharmaceuticals', 'pharmaceutical', 'therapeutics', 
+                'healthcare', 'lifesciences', 'life', 'sciences', 'pvt', 'ltd', 'private', 'limited', 'india', 'inc', 'corp', 
+                'corporation', 'co', 'gmbh', 'sa', 'ag'
+            ]);
+            const words = nameStr.split(/\\s+/);
+            const cleanedWords = words.filter(w => w && !stopwords.has(w));
+            if (cleanedWords.length === 0) {
+                return words.filter(w => w).join(" ");
+            }
+            return cleanedWords.join(" ").trim();
+        }
+
+        // Compare companies for compatibility
+        function companiesCompatible(qComp, cComp) {
+            const qClean = cleanCompanyName(qComp);
+            const cClean = cleanCompanyName(cComp);
+            
+            if (!qClean || !cClean) {
+                return true; 
+            }
+            
+            if (qClean === cClean) {
+                return true;
+            }
+            
+            const qWords = qClean.split(/\\s+/);
+            const cWords = cClean.split(/\\s+/);
+            
+            const qSet = new Set(qWords);
+            for (const w of cWords) {
+                if (w.length >= 3 && qSet.has(w)) {
+                    return true;
+                }
+            }
+            
+            const dice = diceCoefficient(qClean, cClean);
+            if (dice >= 0.75) {
+                return true;
+            }
+            
+            if (qClean.length >= 4 && cClean.length >= 4) {
+                if (qClean.includes(cClean) || cClean.includes(qClean)) {
+                    return true;
+                }
+            }
+            
+            return false;
+        }
+
         // Strict guardrail validation (matches validate_match in matcher.py)
-        function validateMatch(queryName, queryPack, candidate) {
+        function validateMatch(queryName, queryPack, queryComp, candidate) {
             const queryCombined = (queryName + " " + queryPack).trim();
             const qClean = normalizeText(queryCombined);
             const cNameClean = normalizeText(candidate[1]);
@@ -485,12 +550,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const queryIsTab = ['tab', 'tabs', 'tablet', 'tablets'].some(w => queryLower.includes(w));
             const candIsInj = ['inj', 'injection', 'injections'].some(w => candNameLower.includes(w));
             if (queryIsTab && candIsInj) return false;
+
+            // 4. Company compatibility check
+            if (queryComp && queryComp.trim()) {
+                const cBrand = candidate[2] || '';
+                if (cBrand && !companiesCompatible(queryComp, cBrand)) {
+                    return false;
+                }
+            }
             
             return true;
         }
 
         // Strict Heuristics (matches heuristic_match in matcher.py)
-        function heuristicMatch(queryName, queryPack, candidates) {
+        function heuristicMatch(queryName, queryPack, queryComp, candidates) {
             if (candidates.length === 0) return null;
             
             const bestCand = candidates[0];
@@ -550,7 +623,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (queryIsTab && candIsInj) formulationMatch = false;
             
             if (brandExact && numsMatch && formulationMatch) {
-                if (validateMatch(queryName, queryPack, candidate)) {
+                if (validateMatch(queryName, queryPack, queryComp, candidate)) {
                     return candidate;
                 }
             }
@@ -634,6 +707,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         // Main search and match execution
         function doSearchAndMatch() {
             const queryName = nameInput.value.trim();
+            const queryComp = companyInput.value.trim();
             const queryPack = packInput.value.trim();
             
             if (queryName.length < 2) {
@@ -681,7 +755,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             });
             
             // Execute strict matching heuristics (Phase 2)
-            const matchedProduct = heuristicMatch(queryName, queryPack, matches);
+            const matchedProduct = heuristicMatch(queryName, queryPack, queryComp, matches);
             
             // Update Confirm Match Status Card UI
             if (matchedProduct) {
@@ -732,6 +806,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         // Attach event listeners for instant typing search
         nameInput.addEventListener('input', doSearchAndMatch);
+        companyInput.addEventListener('input', doSearchAndMatch);
         packInput.addEventListener('input', doSearchAndMatch);
     </script>
 </body>
@@ -757,12 +832,19 @@ def main():
     
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
+        headers = reader.fieldnames if reader.fieldnames else []
+        key_map = {h.lower(): h for h in headers}
+        
+        def get_val(row, k):
+            actual_key = key_map.get(k.lower())
+            return row.get(actual_key, "") if actual_key else ""
+
         for r in reader:
-            code = r.get("code", "").strip()
-            name = r.get("name", "").strip()
-            compname = r.get("compname", "").strip()
-            pack = r.get("pack", "").strip()
-            strength = r.get("strength", "").strip()
+            code = get_val(r, "code").strip()
+            name = get_val(r, "name").strip()
+            compname = get_val(r, "compname").strip()
+            pack = get_val(r, "pack").strip()
+            strength = get_val(r, "strength").strip()
             
             if code and name:
                 catalog_list.append([code, name, compname, pack, strength])
