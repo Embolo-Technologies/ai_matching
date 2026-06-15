@@ -165,7 +165,7 @@ class FuzzySearcher:
         
         return (front_matches, matched_count, -proximity, exactness, -len_diff)
 
-    def search(self, name: str, pack: str = "", top_k: int = 5) -> Tuple[List[Dict], float]:
+    def search(self, name: str, pack: str = "", compname: str = "", top_k: int = 5) -> Tuple[List[Dict], float]:
         t0 = time.time()
         if not self.is_loaded():
             self.load()
@@ -260,9 +260,21 @@ class FuzzySearcher:
                 )
                 if not brand_in_name:
                     brand_penalty = 0.65
+
+            # Company name matching — boost same company, penalize clear mismatches
+            company_bonus = 0.0
+            if compname and compname.strip():
+                q_comp_norm = self._normalize_text(compname)
+                c_comp_norm = self._normalize_text(item["compname"]) if item["compname"] else ""
+                if q_comp_norm and c_comp_norm:
+                    comp_score = fuzz.partial_ratio(q_comp_norm, c_comp_norm)
+                    if comp_score >= 60:
+                        company_bonus = 10.0  # Same company boost
+                    elif comp_score < 30:
+                        company_bonus = -15.0  # Clear mismatch penalty
                     
             name_score = stage1_score * brand_penalty
-            final_composite_score = (name_score * 0.75) + (pack_score * 0.25)
+            final_composite_score = (name_score * 0.75) + (pack_score * 0.25) + company_bonus
             
             scored_candidates.append({
                 "item": item,

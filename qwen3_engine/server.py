@@ -39,6 +39,7 @@ def match_item_route():
     data = request.get_json(silent=True) or {}
     name = data.get("name", "").strip()
     pack = data.get("pack", "").strip()
+    compname = data.get("company", "").strip() or data.get("compname", "").strip()
     query = data.get("query", "").strip()
     if not query:
         query = f"{name} {pack}".strip()
@@ -47,7 +48,7 @@ def match_item_route():
 
     try:
         t0 = time.time()
-        result = _matcher.match(query, top_k=5, name=name, pack=pack)
+        result = _matcher.match(query, top_k=5, name=name, pack=pack, compname=compname)
         elapsed = time.time() - t0
         return jsonify({
             "query": query,

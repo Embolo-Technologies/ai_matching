@@ -21,6 +21,57 @@ def is_abbreviation(abbrev: str, full: str) -> bool:
     it = iter(full)
     return all(char in it for char in abbrev)
 
+def clean_company_name(name_str: str) -> str:
+    if not name_str:
+        return ""
+    name_str = name_str.lower().strip()
+    if name_str in {"", "--", "none", "null", "nan", "undefined", "unknown", "-"}:
+        return ""
+    # Remove common punctuation
+    name_str = re.sub(r'[^a-z0-9\s]', ' ', name_str)
+    # Remove common business suffixes
+    stopwords = {
+        'laboratories', 'laboratory', 'labs', 'lab', 'pharma', 'pharmaceuticals', 'pharmaceutical', 'therapeutics', 
+        'healthcare', 'lifesciences', 'life', 'sciences', 'pvt', 'ltd', 'private', 'limited', 'india', 'inc', 'corp', 
+        'corporation', 'co', 'gmbh', 'sa', 'ag', 'limited', 'ltd'
+    }
+    words = name_str.split()
+    cleaned_words = [w for w in words if w not in stopwords]
+    if not cleaned_words:
+        cleaned_words = words
+    return " ".join(cleaned_words).strip()
+
+def companies_compatible(q_comp: str, c_comp: str) -> bool:
+    q_clean = clean_company_name(q_comp)
+    c_clean = clean_company_name(c_comp)
+    
+    if not q_clean or not c_clean:
+        return True  # If either side is missing, it's compatible (no info to conflict)
+        
+    if q_clean == c_clean:
+        return True
+        
+    q_words = set(q_clean.split())
+    c_words = set(c_clean.split())
+    
+    # Overlap of non-trivial words (length >= 3)
+    non_trivial_overlap = {w for w in (q_words & c_words) if len(w) >= 3}
+    if non_trivial_overlap:
+        return True
+        
+    # Fuzzy ratio match
+    score = fuzz.ratio(q_clean, c_clean)
+    if score >= 75:
+        return True
+        
+    # Partial ratio match for substrings
+    if len(q_clean) >= 4 and len(c_clean) >= 4:
+        partial = fuzz.partial_ratio(q_clean, c_clean)
+        if partial >= 85:
+            return True
+            
+    return False
+
 class HybridMatcher:
     def __init__(self, master_csv_path: str, model_key: str = "qwen3"):
         self.master_csv_path = master_csv_path
@@ -139,7 +190,7 @@ class HybridMatcher:
         finally:
             conn.close()
 
-    def validate_match(self, query: str, candidate: Dict[str, str], name: str = "") -> bool:
+    def validate_match(self, query: str, candidate: Dict[str, str], name: str = "", compname: str = "") -> bool:
         q_clean = self.normalize_text(query)
         c_name_clean = self.normalize_text(candidate['name'])
         c_brand_clean = self.normalize_text(candidate['brand']) if candidate.get('brand') else ""
@@ -207,9 +258,15 @@ class HybridMatcher:
         if not formulations_compatible(query, candidate['name'] + " " + candidate['pack']):
             return False
 
+        # Smart Company Compatibility check (always checked if input company is provided)
+        if compname and compname.strip() and compname.strip() not in ('--', 'none', 'null', 'nan'):
+            c_brand = candidate.get('brand', '') or ''
+            if c_brand and not companies_compatible(compname, c_brand):
+                return False
+
         return True
 
-    def heuristic_match(self, query: str, candidates: List[Dict[str, str]], name: str = "") -> Optional[Dict[str, str]]:
+    def heuristic_match(self, query: str, candidates: List[Dict[str, str]], name: str = "", compname: str = "") -> Optional[Dict[str, str]]:
         if not candidates:
             return None
             
@@ -299,11 +356,11 @@ class HybridMatcher:
             formulation_match = formulations_compatible(query, cand['name'] + " " + cand['pack'])
 
             if brand_exact and nums_match and formulation_match:
-                if self.validate_match(query, cand, name=name):
+                if self.validate_match(query, cand, name=name, compname=compname):
                     return cand
         return None
-
-    def match(self, query: str, top_k: int = 5, name: str = "", pack: str = "") -> Optional[Dict[str, str]]:
+ 
+    def match(self, query: str, top_k: int = 5, name: str = "", pack: str = "", compname: str = "") -> Optional[Dict[str, str]]:
         cached = self.get_cached_match(query)
         if cached:
             print(f"[Cache Hit] '{query}' matched to '{cached['name']}' (Code: {cached['code']})")
@@ -317,14 +374,14 @@ class HybridMatcher:
             self.save_cached_match(query, None)
             return None
             
-        heur_match = self.heuristic_match(query, candidates, name=name)
+        heur_match = self.heuristic_match(query, candidates, name=name, compname=compname)
         if heur_match:
             print(f"[Heuristic Match] '{query}' matched to '{heur_match['name']}' (Code: {heur_match['code']})")
             self.save_cached_match(query, heur_match)
             return heur_match
             
         print(f"[AI Rerank] Query '{query}' requires LLM logic. Reranking...")
-        llm_match = self.llm_rerank(query, candidates, name=name)
+        llm_match = self.llm_rerank(query, candidates, name=name, compname=compname)
         if llm_match:
             print(f"[LLM Match] '{query}' matched to '{llm_match['name']}' (Code: {llm_match['code']})")
             self.save_cached_match(query, llm_match)
@@ -367,7 +424,7 @@ class HybridMatcher:
             })
         return candidates
 
-    def llm_rerank(self, query: str, candidates: List[Dict[str, str]], name: str = "") -> Optional[Dict[str, str]]:
+    def llm_rerank(self, query: str, candidates: List[Dict[str, str]], name: str = "", compname: str = "") -> Optional[Dict[str, str]]:
         if not self.engine.is_loaded():
             print(f"Loading LLM {self.model_key} into GPU...")
             self.engine.load(n_ctx=N_CTX_MATCHER)
@@ -400,27 +457,27 @@ class HybridMatcher:
         else:
             # Full detailed prompt for 1.7B and larger models
             prompt = (
-                "Wholesaler Input: PAN 40 TAB\n"
+                "Wholesaler Input: PAN 40 TAB (Company: SUN PHARMA)\n"
                 "Master Candidates List:\n"
-                "1. PAN 40 (Pack: 10 TAB, code: 101)\n"
-                "2. PENTAB 40 (Pack: 1 PC, code: 102)\n"
-                "3. PAN D (Pack: 10 CAP, code: 103)\n\n"
+                "1. PAN 40 (Pack: 10 TAB, Company: SUN PHAR, code: 101)\n"
+                "2. PENTAB 40 (Pack: 1 PC, Company: TORQUE, code: 102)\n"
+                "3. PAN D (Pack: 10 CAP, Company: SUN PHAR, code: 103)\n\n"
                 "Analysis:\n"
-                "- Wholesaler input is 'PAN 40 TAB'. Brand is 'PAN', strength is '40', formulation is 'TAB'.\n"
-                "- Candidate 1 matches brand 'PAN' (from 'PAN 40'), strength '40', and formulation 'TAB'. Exact match.\n"
+                "- Wholesaler input is 'PAN 40 TAB'. Brand is 'PAN', strength is '40', formulation is 'TAB', Company is 'SUN PHARMA'.\n"
+                "- Candidate 1 matches brand 'PAN' (from 'PAN 40'), strength '40', formulation 'TAB', and Company 'SUN PHAR'. Exact match.\n"
                 "Result:\n"
                 "```json\n"
                 "{\n"
                 "  \"match_number\": 1\n"
                 "}\n"
                 "```\n\n"
-                "Wholesaler Input: CALPOL 650\n"
+                "Wholesaler Input: CALPOL 650 (Company: GSK)\n"
                 "Master Candidates List:\n"
-                "1. CALPOL 500 (Pack: 15 TAB, code: 201)\n"
-                "2. DOLO 650 (Pack: 15 TAB, code: 202)\n"
-                "3. PENTAB 40 (Pack: 1 PC, code: 203)\n\n"
+                "1. CALPOL 500 (Pack: 15 TAB, Company: GSK, code: 201)\n"
+                "2. DOLO 650 (Pack: 15 TAB, Company: MICRO, code: 202)\n"
+                "3. PENTAB 40 (Pack: 1 PC, Company: TORQUE, code: 203)\n\n"
                 "Analysis:\n"
-                "- Wholesaler input is 'CALPOL 650'. Brand is 'CALPOL', strength is '650'.\n"
+                "- Wholesaler input is 'CALPOL 650'. Brand is 'CALPOL', strength is '650', Company is 'GSK'.\n"
                 "- Candidate 1 has mismatched strength (500 vs 650).\n"
                 "- Candidate 2 has mismatched brand ('DOLO' vs 'CALPOL').\n"
                 "- Candidate 3 has mismatched brand. No candidate matches.\n"
@@ -430,11 +487,26 @@ class HybridMatcher:
                 "  \"match_number\": null\n"
                 "}\n"
                 "```\n\n"
-                f"Wholesaler Input: {query}\n"
+                "Wholesaler Input: BRIV SYRUP 100ML (Company: DR REDDY)\n"
                 "Master Candidates List:\n"
+                "1. BRIVATAB 100ML ORAL SOLUTION (Pack: 100ML, Company: HETERO, code: 301)\n\n"
+                "Analysis:\n"
+                "- Wholesaler input is 'BRIV SYRUP 100ML'. Brand is 'BRIV', strength is '100ML', Company is 'DR REDDY'.\n"
+                "- Candidate 1 has mismatched Company ('HETERO' vs 'DR REDDY'). Companies are different, so it cannot match.\n"
+                "Result:\n"
+                "```json\n"
+                "{\n"
+                "  \"match_number\": null\n"
+                "}\n"
+                "```\n\n"
+                f"Wholesaler Input: {query}"
             )
+            if compname and compname.strip() and compname.strip() != '--':
+                prompt += f" (Company: {compname.strip()})"
+            prompt += "\nMaster Candidates List:\n"
             for i, cand in enumerate(candidates, 1):
-                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, code: {cand['code']})\n"
+                cand_company = cand.get('brand', '') or ''
+                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, Company: {cand_company}, code: {cand['code']})\n"
                 
             prompt += (
                 "\nWrite exactly two sections: 'Analysis:' followed by your step-by-step comparisons, and 'Result:' followed by the final match JSON block.\n\n"
@@ -461,7 +533,7 @@ class HybridMatcher:
                     match_idx = match_num - 1
                     if 0 <= match_idx < len(candidates):
                         cand = candidates[match_idx]
-                        if self.validate_match(query, cand, name=name):
+                        if self.validate_match(query, cand, name=name, compname=compname):
                             return cand
                         else:
                             print(f"[Guardrail] Match code {cand['code']} failed validation checks.")
