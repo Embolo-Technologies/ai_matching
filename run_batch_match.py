@@ -18,6 +18,11 @@ from rapidfuzz import fuzz
 def extract_strength(name_str):
     if not isinstance(name_str, str):
         return ""
+    # Compound doses like "500/125MG" — return full slash expression so both
+    # components are available during strength matching.
+    compound = re.search(r'\b\d+(?:\.\d+)?/\d+(?:\.\d+)?\s*(?:mg|ml|gm|g|mcg)?\b', name_str, re.IGNORECASE)
+    if compound:
+        return compound.group(0)
     match = re.search(r'\b\d+(?:\.\d+)?\s*(?:mg|ml|gm|g|mcg|cap|tab)\b', name_str, re.IGNORECASE)
     if match:
         return match.group(0)
@@ -164,7 +169,6 @@ def main():
     print(f"\n[4/4] Running matches on {len(df_input):,} items...")
     results = []
     matched_count = 0
-    matched_master_codes = set()  # Track matched master codes for 1:1 deduplication
     t_start = time.time()
     total = len(df_input)
 
@@ -180,17 +184,12 @@ def main():
         query_str = f"{q_name} {q_pack}".strip()
 
         t0q = time.time()
-        candidates_res, _ = searcher.search(q_name, pack=q_pack, compname=q_comp, top_k=10)
-        
-        # Filter out already-matched master items (1:1 deduplication)
-        candidates = []
-        for r in candidates_res:
-            if r["code"] not in matched_master_codes:
-                candidates.append({
-                    "code": r["code"], "name": r["name"], "brand": r["compname"],
-                    "pack": r["pack"], "strength": r["strength"],
-                })
-        candidates = candidates[:5]  # Keep top 5 after dedup filtering
+        candidates_res, _ = searcher.search(q_name, pack=q_pack, compname=q_comp, top_k=5)
+        candidates = [
+            {"code": r["code"], "name": r["name"], "brand": r["compname"],
+             "pack": r["pack"], "strength": r["strength"]}
+            for r in candidates_res
+        ]
 
         heur_result, heur_confidence = matcher.heuristic_match(query_str, candidates, name=q_name, compname=q_comp)
         
@@ -236,7 +235,6 @@ def main():
 
         if matched_item:
             matched_count += 1
-            matched_master_codes.add(matched_item['code'])  # Mark as used for dedup
             confidence = compute_confidence(q_name, matched_item['name'], matched_item.get('brand',''), q_pack, matched_item.get('pack',''))
             status = classify_confidence(confidence)
             

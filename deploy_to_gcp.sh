@@ -42,7 +42,20 @@ gcloud config set project "$PROJECT_ID"
 
 # 4. Copy code and spreadsheet files to the VM
 echo -e "\n[3/6] Uploading code and data to VM..."
+# Temporarily move models, heavy CSV, and virtual envs out to speed up transfer
+mv "$LOCAL_CODE_DIR/models" "$LOCAL_CODE_DIR/../models_temp" || true
+mv "$LOCAL_CODE_DIR/Item_export_2026-05-29_17-33-30.csv" "$LOCAL_CODE_DIR/../Item_export_2026-05-29_17-33-30.csv_temp" || true
+mv "$LOCAL_CODE_DIR/qwen3_engine/venv" "$LOCAL_CODE_DIR/../venv_temp" || true
+mv "$LOCAL_CODE_DIR/qwen3_engine/venv_win" "$LOCAL_CODE_DIR/../venv_win_temp" || true
+
+# Perform scp of code directory (now lightweight)
 gcloud compute scp --recurse "$LOCAL_CODE_DIR" "$VM_NAME:~/" --zone="$ZONE"
+
+# Restore files
+mv "$LOCAL_CODE_DIR/../models_temp" "$LOCAL_CODE_DIR/models" || true
+mv "$LOCAL_CODE_DIR/../Item_export_2026-05-29_17-33-30.csv_temp" "$LOCAL_CODE_DIR/Item_export_2026-05-29_17-33-30.csv" || true
+mv "$LOCAL_CODE_DIR/../venv_temp" "$LOCAL_CODE_DIR/qwen3_engine/venv" || true
+mv "$LOCAL_CODE_DIR/../venv_win_temp" "$LOCAL_CODE_DIR/qwen3_engine/venv_win" || true
 gcloud compute scp "$LOCAL_GAMES_DIR/masterdata.xlsx" "$VM_NAME:~/ai/" --zone="$ZONE"
 gcloud compute scp "$LOCAL_GAMES_DIR/input.xlsx" "$VM_NAME:~/ai/" --zone="$ZONE"
 

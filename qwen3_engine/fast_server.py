@@ -26,7 +26,7 @@ def get_free_gpu_memory() -> int:
         out = res.stdout.strip()
         if out:
             lines = [int(x) for x in out.splitlines() if x.strip().isdigit()]
-            return lines[0] if lines else 0
+            return sum(lines) if lines else 0
     except Exception:
         pass
     return 0
@@ -85,6 +85,11 @@ class EnginePool:
 def extract_strength(name_str):
     if not isinstance(name_str, str):
         return ""
+    # Compound doses like "500/125MG" or "875/125" — return full slash expression
+    # so both components end up in c_nums during strength matching.
+    compound = re.search(r'\b\d+(?:\.\d+)?/\d+(?:\.\d+)?\s*(?:mg|ml|gm|g|mcg)?\b', name_str, re.IGNORECASE)
+    if compound:
+        return compound.group(0)
     match = re.search(r'\b\d+(?:\.\d+)?\s*(?:mg|ml|gm|g|mcg|cap|tab)\b', name_str, re.IGNORECASE)
     if match:
         return match.group(0)
@@ -225,9 +230,14 @@ class FastMatcher:
         # Remove all non-alphanumeric except spaces and dots
         text = re.sub(r'[^a-z0-9\s\.]', '', text)
         tokens = text.split()
-        # Strip leading pure-numeric tokens (vendor codes like "001", "123")
+        # Strip leading pure-numeric vendor codes (e.g. "001 PAN 40" → "pan 40")
+        # BUT stop if next token is short (≤2 alpha chars) — that means the number IS part of
+        # the brand name, e.g. "36 D" or "4 PH" (after "4ph" is split by the regex above).
         while tokens and re.match(r'^\d+$', tokens[0]):
-            tokens.pop(0)
+            if len(tokens) > 1 and sum(c.isalpha() for c in tokens[1]) >= 3:
+                tokens.pop(0)
+            else:
+                break
         return ' '.join(tokens)
 
     def _clean_raw_query(self, text: str) -> str:
@@ -239,9 +249,13 @@ class FastMatcher:
         # Remove trailing dots from numbers (650. -> 650)
         text = re.sub(r'(\d)\.(?!\d)', r'\1', text)
         tokens = text.split()
-        # Strip leading pure-numeric tokens (vendor codes like 001, 123)
+        # Strip leading pure-numeric vendor codes, same guard as normalize_text:
+        # only strip if the next token is a real word (≥3 alpha chars).
         while tokens and re.match(r'^\d+$', tokens[0]) and len(tokens[0]) <= 3:
-            tokens.pop(0)
+            if len(tokens) > 1 and sum(c.isalpha() for c in tokens[1]) >= 3:
+                tokens.pop(0)
+            else:
+                break
         return ' '.join(tokens)
 
     def _has_unit_suffix(self, text: str, num: str) -> bool:
@@ -260,13 +274,21 @@ class FastMatcher:
         if not q_words:
             return False
         q_brand = q_words[0]
-        # Skip short vendor prefix codes (e.g. "RS-PAN" -> "pan"), but NOT if the second word is a unit/formulation/number
         UNIT_AND_FORMULATION = {
-            'tab', 'tabs', 'tablet', 'tablets', 'cap', 'caps', 'capsule', 'capsules', 
-            'inj', 'injection', 'syp', 'syrup', 'susp', 'suspension', 'ml', 'mg', 'gm', 'g', 'mcg', 
+            'tab', 'tabs', 'tablet', 'tablets', 'cap', 'caps', 'capsule', 'capsules',
+            'inj', 'injection', 'syp', 'syrup', 'susp', 'suspension', 'ml', 'mg', 'gm', 'g', 'mcg',
             'drop', 'drops', 'cream', 'oint', 'ointment', 'gel', 'lotion', 'vial', 'vials', 'amp', 'amps'
         }
-        if len(q_brand) <= 2 and len(q_words) > 1:
+        if re.match(r'^\d+$', q_brand) and len(q_words) > 1:
+            next_w = q_words[1]
+            alpha_count = sum(c.isalpha() for c in next_w)
+            if alpha_count <= 2 and next_w not in UNIT_AND_FORMULATION:
+                # Compound brand like "36 D" or "4 PH" — fuse into one token
+                q_brand = q_brand + next_w
+            elif alpha_count >= 3:
+                # Leading number was a vendor code; real brand is the next word
+                q_brand = next_w
+        elif len(q_brand) <= 2 and len(q_words) > 1:
             next_word = q_words[1].lower()
             is_num = bool(re.match(r'^\d', next_word))
             if not (is_num or next_word in UNIT_AND_FORMULATION):
@@ -331,6 +353,9 @@ class FastMatcher:
         # Smart Strength Validation Check
         def clean_nums(text: str, pack_text: str = "") -> set:
             text_lower = text.lower() + " " + pack_text.lower()
+            # Split stuck number+letter (e.g. "125mg" -> "125 mg") to guarantee word boundaries
+            text_lower = re.sub(r'([0-9])([a-z])', r'\1 \2', text_lower)
+            text_lower = re.sub(r'([a-z])([0-9])', r'\1 \2', text_lower)
             text_clean = re.sub(r'\b\d+\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules|vial|vials|amp|amps|ampoule|ampoules|sachet|sachets|pc|pcs|piece|pieces|strip|strips|pack|packs|packet|packets|bottle|bottles|bot|tube|tubes|pair|pairs|set|sets|roll|rolls|s)\b', ' ', text_lower)
             nums = re.findall(r'\b\d+(?:\.\d+)?\b', text_clean)
             normalized = set()
@@ -352,7 +377,11 @@ class FastMatcher:
         c_strengths = clean_nums(candidate['name'], candidate.get('strength', '') + ' ' + candidate.get('pack', ''))
         
         if q_strengths and c_strengths:
-            if not (q_strengths & c_strengths):
+            # ALL query strength components must appear in candidate.
+            # issubset catches compound-dose mismatches like "500/125" vs "250/125" —
+            # both share "125" but differ on "500" vs "250". A plain intersection would
+            # pass; issubset correctly rejects because "500" is missing from {"250","125"}.
+            if not q_strengths.issubset(c_strengths):
                 return False
 
         # Comprehensive formulation compatibility check
@@ -387,16 +416,27 @@ class FastMatcher:
             if not q_words:
                 continue
             q_brand = q_words[0]
-            # If the first token is a short vendor prefix (length <= 2), try using the second token
-            if len(q_brand) <= 2 and len(q_words) > 1:
+            if re.match(r'^\d+$', q_brand) and len(q_words) > 1:
+                next_w = q_words[1]
+                alpha_count = sum(c.isalpha() for c in next_w)
+                if alpha_count <= 2 and next_w.isalpha():
+                    q_brand = q_brand + next_w  # compound brand: "36d", "4ph"
+                else:
+                    q_brand = next_w             # vendor code, use real brand word
+            elif len(q_brand) <= 2 and len(q_words) > 1:
                 q_brand = q_words[1]
-                
+
             c_words = c_name_clean.split()
             c_brand_words = c_brand_clean.split()
-            
+
             brand_exact = False
             if c_words:
                 UNIT_SUFFIXES = {'mg', 'ml', 'mcg', 'gm', 'g', 'cap', 'tab', 'tabs', 'caps'}
+                # Detect compound num+letter brand in candidate (e.g. master "36 D CAPS" → "36d")
+                c_compound_brand = ""
+                if (re.match(r'^\d+$', c_words[0]) and len(c_words) > 1
+                        and len(c_words[1]) <= 2 and c_words[1].isalpha()):
+                    c_compound_brand = c_words[0] + c_words[1]
                 c_brand_words_no_num = [w for w in c_words if not w.isdigit() and w not in UNIT_SUFFIXES]
                 c_brand_flat = "".join(c_brand_words_no_num[:2]) if len(c_brand_words_no_num) >= 2 else "".join(c_brand_words_no_num)
                 
@@ -414,7 +454,9 @@ class FastMatcher:
                         return True
                     return False
 
-                if _brands_similar(q_brand_flat, c_brand_flat) or (c_brand_words_no_num and _brands_similar(q_brand_flat, c_brand_words_no_num[0])):
+                if (_brands_similar(q_brand_flat, c_brand_flat)
+                        or (c_brand_words_no_num and _brands_similar(q_brand_flat, c_brand_words_no_num[0]))
+                        or (c_compound_brand and _brands_similar(q_brand_flat, c_compound_brand))):
                     brand_exact = True
                 elif c_brand_words:
                     c_brand_words2_no_num = [w for w in c_brand_words if not w.isdigit() and w not in UNIT_SUFFIXES]

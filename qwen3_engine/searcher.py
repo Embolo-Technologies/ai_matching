@@ -96,6 +96,70 @@ class FuzzySearcher:
         text = re.sub(r'[^a-z0-9\s\.]', '', text) # Keep decimals
         return ' '.join(text.split())
 
+    def _parse_pack(self, pack_str: str) -> tuple:
+        """
+        Extract (qty_str, canonical_unit) from any pack format for cross-format comparison.
+
+        Master verbose formats:
+            "strip of 10 tablets" → ("10", "tab")
+            "bottle of 100 ml Syrup" → ("100", "ml")
+            "tube of 20 gm Cream" → ("20", "gm")
+
+        Vendor compact formats:
+            "10S" / "10 S" / "S10" → ("10", "tab")
+            "100ML" / "60ML"       → ("100", "ml")
+            "1*15" / "3*10 TAB"    → ("15"/"10", "tab")   ← per-strip count
+            "1PS"                  → ("1", "pc")
+            "4 TAB" / "6S"        → ("4"/"6", "tab")
+            "1*15G"               → ("15", "gm")
+        """
+        if not pack_str:
+            return ("", "")
+        text = pack_str.lower().strip().replace(",", " ")
+        # Split stuck number+letter: "100ml" → "100 ml", "10s" → "10 s", "1ps" → "1 ps"
+        text = re.sub(r'([0-9])([a-z])', r'\1 \2', text)
+        text = re.sub(r'([a-z])([0-9])', r'\1 \2', text)
+
+        # ── Unit detection (most-specific first) ─────────────────────────────
+        unit = ""
+        if re.search(r'\bml\b', text):                          unit = "ml"
+        elif re.search(r'\bgm\b|\bgrams?\b', text):             unit = "gm"
+        elif re.search(r'\b(caps?|capsules?)\b', text):         unit = "cap"
+        elif re.search(r'\b(tabs?|tablets?)\b', text):          unit = "tab"
+        elif re.search(r'\bvials?\b', text):                    unit = "vial"
+        elif re.search(r'\b(amps?|ampoules?)\b', text):         unit = "amp"
+        elif re.search(r'\bsachets?\b', text):                  unit = "sachet"
+        elif re.search(r'\b(pc|pcs|pieces?)\b|\bps\b', text):  unit = "pc"
+        elif re.search(r'\bstrips?\b', text):                   unit = "tab"
+
+        # ── Quantity extraction ───────────────────────────────────────────────
+        # A*B / AxB: take B (per-strip count), check for trailing unit suffix
+        mult = re.search(r'(\d+)\s*[x*×]\s*(\d+(?:\.\d+)?)\s*(ml|gm|g\b)?', text)
+        if mult:
+            qty = mult.group(2)
+            if not unit:
+                sfx = (mult.group(3) or "").strip()
+                unit = "ml" if sfx == "ml" else ("gm" if sfx in ("gm", "g") else "tab")
+        else:
+            # "10 s" / "s 10" (strip-S notation)
+            s_trail = re.search(r'(\d+)\s*s\b', text)
+            s_lead  = re.search(r'\bs\s*(\d+)', text)
+            if (s_trail or s_lead) and not unit:
+                qty  = s_trail.group(1) if s_trail else s_lead.group(1)
+                unit = "tab"
+            else:
+                # General: strip container/unit words then grab first number
+                clean = re.sub(
+                    r'\b(ml|gm|g|mg|tab|tabs|tablet|tablets|cap|caps|capsule|capsules|'
+                    r'strip|strips|vial|vials|amp|amps|ampoule|ampoules|sachet|sachets|'
+                    r'pc|pcs|piece|pieces|ps|bottle|tube|box|of|the|per|each)\b',
+                    ' ', text
+                )
+                num = re.search(r'(\d+(?:\.\d+)?)', clean)
+                qty = num.group(1) if num else ""
+
+        return (qty, unit)
+
     def _split_easysol_blob(self, token: str) -> List[str]:
         # Split digits from letters (e.g. "pantop40" -> ["pantop", "40"])
         parts = re.findall(r'([a-z]+|[0-9\.]+)', token)
@@ -241,6 +305,13 @@ class FuzzySearcher:
                     pack_score = 100.0
                 elif q_pack_norm in i_pack_norm or i_pack_norm in q_pack_norm:
                     pack_score = 80.0
+                else:
+                    # Cross-format fallback: "10S" vs "strip of 10 tablets" both → ("10","tab")
+                    q_qty, q_unit = self._parse_pack(pack)
+                    i_qty, i_unit = self._parse_pack(item["pack"])
+                    if q_qty and i_qty and q_qty == i_qty:
+                        if not q_unit or not i_unit or q_unit == i_unit:
+                            pack_score = 90.0  # qty + unit both agree across formats
                     
             # Brand alignment checks (apply 35% penalty to stage 1 score on brand mismatch)
             brand_penalty = 1.0
