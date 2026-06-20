@@ -3,11 +3,83 @@ import sys
 import time
 import re
 import json
+import subprocess
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from rapidfuzz import process, fuzz
 from qwen3_engine.searcher import FuzzySearcher
 from qwen3_engine.pharma_data import formulations_compatible
+
+# ─── GPU Concurrency & Engine Pool Helpers ──────────────────────────────────────────
+def get_free_gpu_memory() -> int:
+    """Returns free GPU memory in MB, or 0 if no GPU/nvidia-smi is available."""
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        out = res.stdout.strip()
+        if out:
+            lines = [int(x) for x in out.splitlines() if x.strip().isdigit()]
+            return lines[0] if lines else 0
+    except Exception:
+        pass
+    return 0
+
+def calculate_optimal_workers(model_key: str) -> int:
+    """Dynamically estimates optimal worker pool size based on available GPU VRAM."""
+    from qwen3_engine.config import MODEL_REGISTRY
+    if model_key not in MODEL_REGISTRY:
+        return 1
+    
+    cfg = MODEL_REGISTRY[model_key]
+    model_size_mb = cfg.get("size_mb", 1000)
+    # Quantized GGUF models take roughly 1.15x size in VRAM, plus ~300MB KV Cache / overhead
+    vram_per_worker = int(model_size_mb * 1.15 + 300)
+    
+    free_mem = get_free_gpu_memory()
+    if free_mem <= 0:
+        # CPU-only fallback: use half of available CPU cores
+        import multiprocessing
+        return max(1, multiprocessing.cpu_count() // 2)
+    
+    # Reserve 3.5GB buffer VRAM for driver overhead, backend server, and context batches
+    buffer_mem = 3500
+    available_mem = free_mem - buffer_mem
+    if available_mem <= 0:
+        return 1
+        
+    optimal_workers = available_mem // vram_per_worker
+    return max(1, int(optimal_workers))
+
+class EnginePool:
+    """Thread-safe pool of independent model instances to prevent concurrency race conditions."""
+    def __init__(self, model_key: str, size: int):
+        self.model_key = model_key
+        self.size = size
+        self.pool = queue.Queue()
+        
+    def populate(self):
+        from qwen3_engine.engine import Qwen3Engine
+        from qwen3_engine.config import N_CTX_MATCHER
+        print(f"[EnginePool] Initializing {self.size} workers for model '{self.model_key}'...")
+        for i in range(self.size):
+            t0 = time.time()
+            engine = Qwen3Engine(model_key=self.model_key)
+            engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+            self.pool.put(engine)
+            print(f"  ✓ Worker {i+1}/{self.size} loaded in {time.time()-t0:.1f}s")
+            
+    def lease(self):
+        return self.pool.get()
+        
+    def release(self, engine):
+        self.pool.put(engine)
 
 # ─── Batch Match Helper Functions ────────────────────────────────────────────────
 def extract_strength(name_str):
@@ -125,7 +197,7 @@ def is_abbreviation(abbrev: str, full: str) -> bool:
     return all(char in it for char in abbrev)
 
 class FastMatcher:
-    def __init__(self, searcher_instance, model_key: str = "qwen3"):
+    def __init__(self, searcher_instance, model_key: str = "gemma4_2b"):
         self.searcher = searcher_instance
         self.catalog = []
         self.model_key = model_key
@@ -407,22 +479,23 @@ class FastMatcher:
                     return cand, brand_score
         return None, 0
 
-    def llm_rerank(self, query: str, candidates: list, name: str = "", compname: str = "") -> dict:
+    def llm_rerank(self, query: str, candidates: list, name: str = "", compname: str = "", engine=None) -> dict:
         """AI fallback: ask the local LLM to pick the correct match."""
-        global _llm_engines
-        engine = _llm_engines.get(self.model_key)
         if engine is None:
-            try:
-                from qwen3_engine.engine import Qwen3Engine
-                from qwen3_engine.config import N_CTX_MATCHER
-                engine = Qwen3Engine(model_key=self.model_key)
-                print(f"[AI] Loading local {self.model_key} LLM for fallback matching...")
-                engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
-                print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
-                _llm_engines[self.model_key] = engine
-            except Exception as e:
-                print(f"[AI] ⚠ Could not load LLM {self.model_key}: {e}")
-                return None
+            global _llm_engines
+            engine = _llm_engines.get(self.model_key)
+            if engine is None:
+                try:
+                    from qwen3_engine.engine import Qwen3Engine
+                    from qwen3_engine.config import N_CTX_MATCHER
+                    engine = Qwen3Engine(model_key=self.model_key)
+                    print(f"[AI] Loading local {self.model_key} LLM for fallback matching...")
+                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                    _llm_engines[self.model_key] = engine
+                except Exception as e:
+                    print(f"[AI] ⚠ Could not load LLM {self.model_key}: {e}")
+                    return None
 
         if not engine or not engine.is_loaded():
             return None
@@ -534,23 +607,24 @@ class FastMatcher:
             print(f"[AI] Parse error: {e}")
         return None
 
-    def ai_verify(self, query: str, candidate: dict, name: str = "", compname: str = "") -> bool:
+    def ai_verify(self, query: str, candidate: dict, name: str = "", compname: str = "", engine=None) -> bool:
         """AI verification: ask the LLM if a heuristic match is correct (yes/no).
         Used for medium-confidence matches (80-94% brand similarity)."""
-        global _llm_engines
-        engine = _llm_engines.get(self.model_key)
         if engine is None:
-            try:
-                from qwen3_engine.engine import Qwen3Engine
-                from qwen3_engine.config import N_CTX_MATCHER
-                engine = Qwen3Engine(model_key=self.model_key)
-                print(f"[AI] Loading local {self.model_key} LLM for verification...")
-                engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
-                print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
-                _llm_engines[self.model_key] = engine
-            except Exception as e:
-                print(f"[AI] ✗ Failed to load LLM: {e}")
-                return False
+            global _llm_engines
+            engine = _llm_engines.get(self.model_key)
+            if engine is None:
+                try:
+                    from qwen3_engine.engine import Qwen3Engine
+                    from qwen3_engine.config import N_CTX_MATCHER
+                    engine = Qwen3Engine(model_key=self.model_key)
+                    print(f"[AI] Loading local {self.model_key} LLM for verification...")
+                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                    _llm_engines[self.model_key] = engine
+                except Exception as e:
+                    print(f"[AI] ✗ Failed to load LLM: {e}")
+                    return False
 
         if not engine or not engine.is_loaded():
             return False
@@ -602,7 +676,7 @@ class FastMatcher:
         return False
 
 
-    def match(self, query: str, name: str = "", pack: str = "", compname: str = "") -> dict:
+    def match(self, query: str, name: str = "", pack: str = "", compname: str = "", engine=None) -> dict:
         results, _ = self.searcher.search(name if name else query, pack=pack, top_k=5)
         candidates = []
         for r in results:
@@ -624,7 +698,7 @@ class FastMatcher:
             else:
                 # MEDIUM confidence → ask AI to verify
                 print(f"[AI Verify] Heuristic matched '{query}' → '{heur_match['name']}' (confidence={confidence}%). Verifying with AI...")
-                if self.ai_verify(query, heur_match, name=name, compname=compname):
+                if self.ai_verify(query, heur_match, name=name, compname=compname, engine=engine):
                     return heur_match
                 else:
                     print(f"[AI Verify] Rejected: '{heur_match['name']}' is NOT the same as '{query}'")
@@ -632,7 +706,7 @@ class FastMatcher:
         # Stage 2: AI fallback (slow but accurate for edge cases)
         if candidates:
             print(f"[AI Fallback] Heuristic failed for '{query}'. Asking LLM...")
-            ai_match = self.llm_rerank(query, candidates, name=name, compname=compname)
+            ai_match = self.llm_rerank(query, candidates, name=name, compname=compname, engine=engine)
             if ai_match:
                 return ai_match
 
@@ -679,8 +753,15 @@ def match_item():
 
             temp_searcher = FuzzySearcher(temp_path)
             temp_searcher.load()
-            temp_matcher  = FastMatcher(temp_searcher, model_key="qwen3_1.7b")
+            temp_matcher  = FastMatcher(temp_searcher, model_key="gemma4_2b")
             temp_matcher.load_catalog()
+
+            # ── Calculate optimal workers & initialize Engine Pool ──────────
+            pool_size = calculate_optimal_workers("gemma4_2b")
+            print(f"[Batch Match] Dynamically using {pool_size} workers based on GPU VRAM availability.")
+            
+            engine_pool = EnginePool(model_key="gemma4_2b", size=pool_size)
+            engine_pool.populate()
 
             mappings = []
             total    = len(products)
@@ -689,6 +770,7 @@ def match_item():
             # ── Shared state for the daemon reporter thread ───────────────────
             _state       = {"processed": 0, "matched": 0}
             _done_event  = threading.Event()
+            counter_lock = threading.Lock()
 
             def _http_push(processed, matched):
                 """Fire a single HTTP POST to the backend progress endpoint."""
@@ -733,43 +815,60 @@ def match_item():
             reporter = threading.Thread(target=_reporter_thread, daemon=True)
             reporter.start()
 
-            # ── Main matching loop (uninterrupted) ────────────────────────────
-            try:
-                for prod in products:
-                    prod_name = prod.get("name", "").strip()
-                    prod_pack = prod.get("pack", "").strip()
-                    prod_comp = prod.get("company", "").strip()
-                    prod_code = prod.get("code", "").strip()
+            # Worker function for parallel execution
+            def process_product(prod):
+                prod_name = prod.get("name", "").strip()
+                prod_pack = prod.get("pack", "").strip()
+                prod_comp = prod.get("company", "").strip()
+                prod_code = prod.get("code", "").strip()
 
+                engine = engine_pool.lease()
+                try:
                     res_match = temp_matcher.match(
                         f"{prod_name} {prod_pack}".strip(),
-                        name=prod_name, pack=prod_pack, compname=prod_comp
+                        name=prod_name, pack=prod_pack, compname=prod_comp,
+                        engine=engine
                     )
-                    if res_match:
-                        conf = compute_confidence(
-                            prod_name,
-                            res_match['name'],
-                            res_match.get('brand', ''),
-                            prod_pack,
-                            res_match.get('pack', '')
-                        )
-                        mappings.append({
-                            "vendor_code":    prod_code,
-                            "master_id":      res_match["code"],
-                            "product_name":   prod_name,
-                            "company":        prod_comp,
-                            "pack":           prod_pack,
-                            "source":         "gpu_ai",
-                            "confidence":     float(conf)
-                        })
+                finally:
+                    engine_pool.release(engine)
 
-                    # Update shared counters — daemon thread reads these
+                if res_match:
+                    conf = compute_confidence(
+                        prod_name,
+                        res_match['name'],
+                        res_match.get('brand', ''),
+                        prod_pack,
+                        res_match.get('pack', '')
+                    )
+                    mappings.append({
+                        "vendor_code":    prod_code,
+                        "master_id":      res_match["code"],
+                        "product_name":   prod_name,
+                        "company":        prod_comp,
+                        "pack":           prod_pack,
+                        "source":         "gpu_ai",
+                        "confidence":     float(conf)
+                    })
+
+                with counter_lock:
                     _state["processed"] += 1
                     _state["matched"]    = len(mappings)
+
+            # ── Main matching loop (Parallel ThreadPoolExecutor) ──────────────
+            try:
+                with ThreadPoolExecutor(max_workers=pool_size) as executor:
+                    executor.map(process_product, products)
             finally:
                 # Signal daemon to fire its final push and exit cleanly
                 _done_event.set()
                 reporter.join(timeout=10)
+                # Clean up engine pool and free VRAM
+                try:
+                    del engine_pool
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
 
             return jsonify({"mappings": mappings})
 
@@ -861,8 +960,9 @@ def main():
     _matcher.load_catalog()
     
     # Check if AI model is available
+    from qwen3_engine.config import MODEL_REGISTRY, DEFAULT_MODEL
     model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
-    model_file = os.path.join(model_dir, "Qwen3-0.6B-Q4_K_M.gguf")
+    model_file = os.path.join(model_dir, MODEL_REGISTRY[DEFAULT_MODEL]["filename"])
     if os.path.exists(model_file):
         print("✓ AI model found — LLM fallback enabled (lazy load on first miss).")
     else:

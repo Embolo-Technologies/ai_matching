@@ -95,7 +95,7 @@ MODEL_REGISTRY = {
     },
 }
 
-DEFAULT_MODEL = "qwen3"
+DEFAULT_MODEL = "gemma4_2b"
 
 # ─── Chat Templates ────────────────────────────────────────────────────────────
 TEMPLATES = {

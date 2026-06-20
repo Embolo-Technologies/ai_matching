@@ -143,7 +143,7 @@ def main():
     print(f"\n[2/4] Initializing matching engine...")
     searcher = FuzzySearcher(temp_csv)
     searcher.load()
-    matcher = FastMatcher(searcher, model_key="qwen3_1.7b")
+    matcher = FastMatcher(searcher, model_key="gemma4_2b")
     matcher.load_catalog()
     print(f"   ✓ Engine ready")
 
