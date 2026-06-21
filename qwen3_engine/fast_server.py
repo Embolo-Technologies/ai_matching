@@ -55,7 +55,8 @@ def calculate_optimal_workers(model_key: str) -> int:
         return 1
         
     optimal_workers = available_mem // vram_per_worker
-    return max(1, int(optimal_workers))
+    return max(1, min(40, int(optimal_workers)))
+
 
 class EnginePool:
     """Thread-safe pool of independent model instances to prevent concurrency race conditions."""
