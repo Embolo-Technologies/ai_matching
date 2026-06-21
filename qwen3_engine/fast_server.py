@@ -805,7 +805,8 @@ def match_item():
             engine_pool = EnginePool(model_key="gemma4_2b", size=pool_size)
             engine_pool.populate()
 
-            mappings = []
+            mappings  = []   # matched items
+            unmatched = []   # products with no master match
             total    = len(products)
             t_start  = time.time()
 
@@ -883,13 +884,23 @@ def match_item():
                         res_match.get('pack', '')
                     )
                     mappings.append({
-                        "vendor_code":    prod_code,
-                        "master_id":      res_match["code"],
-                        "product_name":   prod_name,
-                        "company":        prod_comp,
-                        "pack":           prod_pack,
-                        "source":         "gpu_ai",
-                        "confidence":     float(conf)
+                        "vendor_code":      prod_code,
+                        "master_id":        res_match["code"],
+                        "product_name":     prod_name,
+                        "company":          prod_comp,
+                        "pack":             prod_pack,
+                        "matched_name":     res_match["name"],
+                        "matched_pack":     res_match.get("pack", ""),
+                        "matched_company":  res_match.get("brand", ""),
+                        "source":           "gpu_ai",
+                        "confidence":       float(conf)
+                    })
+                else:
+                    unmatched.append({
+                        "vendor_code":  prod_code,
+                        "product_name": prod_name,
+                        "company":      prod_comp,
+                        "pack":         prod_pack,
                     })
 
                 with counter_lock:
@@ -912,7 +923,7 @@ def match_item():
                 except Exception:
                     pass
 
-            return jsonify({"mappings": mappings})
+            return jsonify({"mappings": mappings, "unmatched": unmatched})
 
         except Exception as e:
             return jsonify({"error": f"Batch match failed: {str(e)}"}), 500
