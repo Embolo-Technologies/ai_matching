@@ -1092,11 +1092,7 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        pool_size = calculate_optimal_workers("gemma4_2b")
-        from qwen3_engine.vllm_engine import VLLMEngine
-        probe = VLLMEngine()
-        if probe.check_ready(timeout=2.0):
-            pool_size = 80
+        pool_size = 80  # hardcoded — always use 80 workers
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
