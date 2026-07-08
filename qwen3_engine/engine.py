@@ -14,13 +14,24 @@ from qwen3_engine.config import (
 )
 
 class Qwen3Engine:
-    _gpu_lock = threading.Lock()
+    # One lock per GPU — workers on different GPUs run concurrently.
+    # Populated on first use via _get_gpu_lock(); keyed by gpu_id (int).
+    _gpu_locks: dict = {}
+    _gpu_locks_mutex = threading.Lock()
+
+    @classmethod
+    def _get_gpu_lock(cls, gpu_id: int) -> threading.Lock:
+        with cls._gpu_locks_mutex:
+            if gpu_id not in cls._gpu_locks:
+                cls._gpu_locks[gpu_id] = threading.Lock()
+            return cls._gpu_locks[gpu_id]
 
     def __init__(
         self,
         model_key: Optional[str] = None,
         system_prompt: Optional[str] = None,
         thinking_mode: Optional[bool] = None,
+        gpu_id: int = 0,
     ):
         self.model_key = model_key or DEFAULT_MODEL
         if self.model_key not in MODEL_REGISTRY:
@@ -40,6 +51,7 @@ class Qwen3Engine:
             else (THINKING_MODE_DEFAULT and self._cfg["supports_thinking"])
         )
         self._llm        = None
+        self._gpu_id     = gpu_id
         self.history: List[Dict[str, str]] = []
         self._load_time  = 0.0
         self._loaded_ctx = 0
@@ -52,7 +64,7 @@ class Qwen3Engine:
     def supports_thinking(self) -> bool:
         return self._cfg["supports_thinking"]
 
-    def load(self, n_ctx: int = None) -> None:
+    def load(self, n_ctx: int = None, num_gpus: int = 1) -> None:
         if not os.path.exists(self._model_path):
             print(f"[Engine] Model file not found at {self._model_path}. Downloading automatically...")
             try:
@@ -74,16 +86,32 @@ class Qwen3Engine:
         n_gpu_layers = self._cfg.get("n_gpu_layers", N_GPU_LAYERS)
         effective_ctx = n_ctx if n_ctx is not None else N_CTX
         self._loaded_ctx = effective_ctx
-        self._llm = Llama(
+
+        # Build tensor_split to pin this instance to self._gpu_id.
+        # tensor_split[i] = fraction of model layers placed on GPU i.
+        # Setting slot gpu_id=1.0 and all others=0.0 routes the entire model
+        # to that GPU, regardless of how many GPUs the system exposes.
+        if num_gpus > 1:
+            tensor_split = [0.0] * num_gpus
+            tensor_split[self._gpu_id] = 1.0
+        else:
+            tensor_split = None
+
+        llm_kwargs = dict(
             model_path=self._model_path,
             n_ctx=effective_ctx,
             n_gpu_layers=n_gpu_layers,
+            main_gpu=self._gpu_id,
             n_threads=N_THREADS,
             n_batch=N_BATCH,
             verbose=VERBOSE_LLAMA,
             flash_attn=True,
             use_mmap=True,
         )
+        if tensor_split is not None:
+            llm_kwargs["tensor_split"] = tensor_split
+
+        self._llm = Llama(**llm_kwargs)
         self._load_time = time.time() - t0
 
     def is_loaded(self) -> bool:
@@ -168,7 +196,7 @@ class Qwen3Engine:
             effective_max = effective_max * 4
 
         raw_tokens = []
-        with Qwen3Engine._gpu_lock:
+        with Qwen3Engine._get_gpu_lock(self._gpu_id):
             for chunk in self._llm(
                 prompt,
                 max_tokens=effective_max,

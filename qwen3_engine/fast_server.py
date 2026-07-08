@@ -14,63 +14,68 @@ from qwen3_engine.searcher import FuzzySearcher
 from qwen3_engine.pharma_data import formulations_compatible
 
 # ─── GPU Concurrency & Engine Pool Helpers ──────────────────────────────────────────
-def get_free_gpu_memory() -> int:
-    """Returns free GPU memory in MB, or 0 if no GPU/nvidia-smi is available."""
-    try:
-        res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        out = res.stdout.strip()
-        if out:
-            lines = [int(x) for x in out.splitlines() if x.strip().isdigit()]
-            return sum(lines) if lines else 0
-    except Exception:
-        pass
-    return 0
-
-def calculate_optimal_workers(model_key: str) -> int:
-    """Auto-detects GPU VRAM and returns safe worker count.
-    Each worker needs ~1.82GB VRAM (model weights + KV cache at n_ctx=1024).
-    Leaves ~7GB buffer for safety.
+def get_gpu_info() -> tuple:
+    """
+    Returns (num_gpus, vram_mb_per_gpu) where vram_mb_per_gpu is a list.
+    Falls back to (0, []) if nvidia-smi is unavailable.
     """
     try:
-        import subprocess
-        result = subprocess.run(
+        res = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5, check=True
         )
-        total_vram_mb = int(result.stdout.strip())
-        if total_vram_mb >= 70000:   # A100 80GB
-            return 40
-        elif total_vram_mb >= 35000: # A100 40GB
-            return 20
-        else:
-            return max(1, int((total_vram_mb - 6000) // 1900))
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip().isdigit()]
+        vram_list = [int(x) for x in lines]
+        return len(vram_list), vram_list
     except Exception:
-        return 16  # safe fallback
+        return 0, []
+
+
+def calculate_optimal_workers(model_key: str) -> int:
+    """
+    Auto-detects number of GPUs and VRAM per GPU.
+    Returns total safe worker count across all GPUs.
+    Each worker needs ~1.82 GB (model weights + KV cache at n_ctx=1024).
+    Leaves ~4 GB buffer per GPU for safety.
+    """
+    num_gpus, vram_list = get_gpu_info()
+    if not vram_list:
+        return 16  # safe CPU-only fallback
+
+    total_workers = 0
+    for vram_mb in vram_list:
+        safe_workers = max(1, int((vram_mb - 4000) // 1900))
+        total_workers += safe_workers
+
+    print(f"[Workers] {num_gpus} GPU(s) detected: {vram_list} MB each → {total_workers} total workers")
+    return total_workers
+
+
+def get_num_gpus() -> int:
+    """Returns number of available GPUs (0 if none)."""
+    num_gpus, _ = get_gpu_info()
+    return num_gpus
 
 
 class EnginePool:
-    """Thread-safe pool of independent model instances to prevent concurrency race conditions."""
+    """Thread-safe pool of independent model instances spread across all available GPUs."""
     def __init__(self, model_key: str, size: int):
         self.model_key = model_key
         self.size = size
         self.pool = queue.Queue()
-        
+        self.num_gpus = max(1, get_num_gpus())
+
     def populate(self):
         from qwen3_engine.engine import Qwen3Engine
         from qwen3_engine.config import N_CTX_MATCHER
-        print(f"[EnginePool] Loading {self.size} workers sequentially (n_ctx={N_CTX_MATCHER})...")
+        print(f"[EnginePool] Loading {self.size} workers across {self.num_gpus} GPU(s) (n_ctx={N_CTX_MATCHER})...")
         for i in range(self.size):
+            gpu_id = i % self.num_gpus
             t0 = time.time()
-            engine = Qwen3Engine(model_key=self.model_key)
-            engine.load(n_ctx=N_CTX_MATCHER)
+            engine = Qwen3Engine(model_key=self.model_key, gpu_id=gpu_id)
+            engine.load(n_ctx=N_CTX_MATCHER, num_gpus=self.num_gpus)
             self.pool.put(engine)
-            print(f"  ✓ Worker {i+1}/{self.size} ready in {time.time()-t0:.1f}s")
+            print(f"  ✓ Worker {i+1}/{self.size} on GPU {gpu_id} ready in {time.time()-t0:.1f}s")
             
     def lease(self):
         return self.pool.get()
