@@ -57,7 +57,7 @@ def calculate_optimal_workers(model_key: str) -> int:
         
     optimal_workers = available_mem // vram_per_worker
     # Cap maximum parallel GPU workers at 16 (A100 40GB can fit 16 at n_ctx=1024)
-    return min(30, max(1, int(optimal_workers)))
+    return min(40, max(1, int(optimal_workers)))
 
 
 class EnginePool:
