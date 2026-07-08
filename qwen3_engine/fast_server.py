@@ -993,9 +993,11 @@ def search_item():
 
 @app.route("/health", methods=["GET"])
 def health():
-    if _searcher is None or _matcher is None or _engine_pool is None:
+    if _searcher is None or _matcher is None:
         return jsonify({"status": "initialising"}), 503
-    return jsonify({"status": "ok", "mode": "standalone_fast", "workers": _engine_pool.size})
+    pool_size = _engine_pool.size if _engine_pool else 0
+    return jsonify({"status": "ok", "mode": "standalone_fast", "workers": pool_size})
+
 
 def get_gce_metadata(attribute_name: str) -> str:
     url = f"http://metadata.google.internal/computeMetadata/v1/instance/attributes/{attribute_name}"
