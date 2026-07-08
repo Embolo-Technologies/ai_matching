@@ -1095,7 +1095,7 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        pool_size = 80  # hardcoded — always use 80 workers
+        pool_size = 8  # 10 Gunicorn processes * 8 engines = 80 total engines
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
