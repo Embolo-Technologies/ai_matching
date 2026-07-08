@@ -33,8 +33,25 @@ def get_free_gpu_memory() -> int:
     return 0
 
 def calculate_optimal_workers(model_key: str) -> int:
-    """Returns fixed 40 workers — tuned for A100 40GB GPU with n_ctx=1024 and mmap=True."""
-    return 20
+    """Auto-detects GPU VRAM and returns safe worker count.
+    Each worker needs ~1.82GB VRAM (model weights + KV cache at n_ctx=1024).
+    Leaves ~7GB buffer for safety.
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        total_vram_mb = int(result.stdout.strip())
+        if total_vram_mb >= 70000:   # A100 80GB
+            return 40
+        elif total_vram_mb >= 35000: # A100 40GB
+            return 20
+        else:
+            return max(1, int((total_vram_mb - 6000) // 1900))
+    except Exception:
+        return 16  # safe fallback
 
 
 class EnginePool:
