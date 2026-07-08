@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import threading
 from typing import Generator, List, Dict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,6 +14,8 @@ from qwen3_engine.config import (
 )
 
 class Qwen3Engine:
+    _gpu_lock = threading.Lock()
+
     def __init__(
         self,
         model_key: Optional[str] = None,
@@ -165,17 +168,18 @@ class Qwen3Engine:
             effective_max = effective_max * 4
 
         raw_tokens = []
-        for chunk in self._llm(
-            prompt,
-            max_tokens=effective_max,
-            temperature=temperature if temperature is not None else TEMPERATURE,
-            top_p=top_p or TOP_P,
-            top_k=top_k or TOP_K,
-            repeat_penalty=repeat_penalty or REPEAT_PENALTY,
-            stream=True,
-            stop=self._template["stop_tokens"],
-        ):
-            raw_tokens.append(chunk["choices"][0]["text"])
+        with Qwen3Engine._gpu_lock:
+            for chunk in self._llm(
+                prompt,
+                max_tokens=effective_max,
+                temperature=temperature if temperature is not None else TEMPERATURE,
+                top_p=top_p or TOP_P,
+                top_k=top_k or TOP_K,
+                repeat_penalty=repeat_penalty or REPEAT_PENALTY,
+                stream=True,
+                stop=self._template["stop_tokens"],
+            ):
+                raw_tokens.append(chunk["choices"][0]["text"])
 
         raw_text   = "".join(raw_tokens)
         clean_text = re.sub(r"<think>.*?</think>\s*", "", raw_text, flags=re.DOTALL).lstrip("\n")
