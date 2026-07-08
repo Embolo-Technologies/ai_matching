@@ -33,31 +33,8 @@ def get_free_gpu_memory() -> int:
     return 0
 
 def calculate_optimal_workers(model_key: str) -> int:
-    """Dynamically estimates optimal worker pool size based on available GPU VRAM."""
-    from qwen3_engine.config import MODEL_REGISTRY
-    if model_key not in MODEL_REGISTRY:
-        return 1
-    
-    cfg = MODEL_REGISTRY[model_key]
-    model_size_mb = cfg.get("size_mb", 1000)
-    # Quantized GGUF models take roughly 1.15x size in VRAM, plus ~300MB KV Cache / overhead
-    vram_per_worker = int(model_size_mb * 1.15 + 300)
-    
-    free_mem = get_free_gpu_memory()
-    if free_mem <= 0:
-        # CPU-only fallback: use half of available CPU cores
-        import multiprocessing
-        return max(1, multiprocessing.cpu_count() // 2)
-    
-    # Reserve 3.5GB buffer VRAM for driver overhead, backend server, and context batches
-    buffer_mem = 3500
-    available_mem = free_mem - buffer_mem
-    if available_mem <= 0:
-        return 1
-        
-    optimal_workers = available_mem // vram_per_worker
-    # Cap maximum parallel GPU workers at 16 (A100 40GB can fit 16 at n_ctx=1024)
-    return min(40, max(1, int(optimal_workers)))
+    """Returns fixed 30 workers — tuned for A100 40GB GPU with n_ctx=1024 and mmap=True."""
+    return 30
 
 
 class EnginePool:
