@@ -820,7 +820,16 @@ def match_item():
         )
 
         # ── Use pre-loaded global searcher and engine pool ──────────────────
-        if _searcher is None or _matcher is None or _engine_pool is None:
+        if _searcher is None or _matcher is None:
+            return jsonify({"error": "Server still initialising — searchers not ready."}), 503
+
+        # Wait up to 60 seconds for engine pool to finish populating in the background
+        wait_elapsed = 0
+        while _engine_pool is None and wait_elapsed < 60:
+            time.sleep(0.5)
+            wait_elapsed += 0.5
+
+        if _engine_pool is None:
             return jsonify({"error": "Server still initialising — pool not ready."}), 503
 
         temp_matcher = _matcher
