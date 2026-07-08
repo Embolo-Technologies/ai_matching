@@ -181,4 +181,4 @@ LLAMA_SERVER_BASE_URL  = os.environ.get("LLAMA_SERVER_BASE_URL", "http://localho
 LLAMA_SERVER_MODEL     = os.environ.get("LLAMA_SERVER_MODEL", os.path.join(MODELS_DIR, MODEL_REGISTRY["gemma4_2b"]["filename"]))
 LLAMA_SERVER_N_CTX     = int(os.environ.get("LLAMA_SERVER_N_CTX", "1024"))
 LLAMA_SERVER_N_GPU_LAYERS = int(os.environ.get("LLAMA_SERVER_N_GPU_LAYERS", "-1"))
-LLAMA_SERVER_MAX_WORKERS = int(os.environ.get("LLAMA_SERVER_MAX_WORKERS", "40"))
+LLAMA_SERVER_MAX_WORKERS = int(os.environ.get("LLAMA_SERVER_MAX_WORKERS", "60"))
