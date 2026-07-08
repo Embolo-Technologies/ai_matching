@@ -1,4 +1,5 @@
 import os
+os.environ["GGML_CUDA_DISABLE_GRAPHS"] = "1"
 import sys
 import time
 import re
@@ -55,7 +56,8 @@ def calculate_optimal_workers(model_key: str) -> int:
         return 1
         
     optimal_workers = available_mem // vram_per_worker
-    return max(1, min(40, int(optimal_workers)))
+    # Cap maximum parallel GPU workers at 16 (A100 40GB can fit 16 at n_ctx=1024)
+    return min(30, max(1, int(optimal_workers)))
 
 
 class EnginePool:
@@ -68,11 +70,11 @@ class EnginePool:
     def populate(self):
         from qwen3_engine.engine import Qwen3Engine
         from qwen3_engine.config import N_CTX_MATCHER
-        print(f"[EnginePool] Initializing {self.size} workers for model '{self.model_key}'...")
+        print(f"[EnginePool] Initializing {self.size} workers (n_ctx={N_CTX_MATCHER})...")
         for i in range(self.size):
             t0 = time.time()
             engine = Qwen3Engine(model_key=self.model_key)
-            engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+            engine.load(n_ctx=N_CTX_MATCHER)
             self.pool.put(engine)
             print(f"  ✓ Worker {i+1}/{self.size} loaded in {time.time()-t0:.1f}s")
             
@@ -628,7 +630,7 @@ class FastMatcher:
             prompt += "\nResult:"
 
         engine.clear_history()
-        response = engine.generate(prompt, max_tokens=100, temperature=0.0).strip()
+        response = engine.generate(prompt, max_tokens=50, temperature=0.0).strip()
         print(f"[AI] LLM Output:\n{response}")
 
         try:
@@ -720,7 +722,23 @@ class FastMatcher:
 
 
     def match(self, query: str, name: str = "", pack: str = "", compname: str = "", engine=None) -> dict:
-        results, _ = self.searcher.search(name if name else query, pack=pack, top_k=5)
+        search_query = name if name else query
+        results, _ = self.searcher.search(search_query, pack=pack, compname=compname, top_k=8)
+
+        # Second-pass: if first search returned fewer than 4 results, retry with
+        # just the first substantive word (catches abbreviations like "AMC" → "AMOXICLAV")
+        if len(results) < 4:
+            words = [w for w in re.sub(r'[^a-zA-Z0-9\s]', ' ', search_query).split()
+                     if len(w) >= 3 and not w.isdigit()]
+            if words:
+                extra, _ = self.searcher.search(words[0], pack=pack, compname=compname, top_k=8)
+                seen = {r["code"] for r in results}
+                for r in extra:
+                    if r["code"] not in seen:
+                        results.append(r)
+                        seen.add(r["code"])
+                results = results[:8]
+
         candidates = []
         for r in results:
             candidates.append({
@@ -756,6 +774,7 @@ class FastMatcher:
         return None
 
 _matcher = None
+_engine_pool = None   # pre-loaded at startup; None until ready
 
 @app.route("/match", methods=["POST"])
 def match_item():
@@ -763,8 +782,7 @@ def match_item():
 
     if "products" in data:
         # ── Batch match mode ──────────────────────────────────────────────────
-        products        = data.get("products", [])
-        master_medicines= data.get("master_medicines", [])
+        products      = data.get("products", [])
 
         # Progress callback info (injected by backend)
         backend_url   = (data.get("backend_url") or "").rstrip("/")
@@ -775,170 +793,144 @@ def match_item():
             if backend_url and job_id and signal_secret else None
         )
 
-        import tempfile, csv, threading
+        # ── Use pre-loaded global searcher and engine pool ──────────────────
+        if _searcher is None or _matcher is None or _engine_pool is None:
+            return jsonify({"error": "Server still initialising — pool not ready."}), 503
 
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".csv")
-        try:
-            # Write master medicines to temp CSV (batch mode ignores the startup CSV)
-            with open(temp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                for m in master_medicines:
-                    name_str = m.get("name", "").strip()
-                    writer.writerow({
-                        'code':     m.get("master_id", ""),
-                        'name':     name_str,
-                        'Compname': m.get("company", "").strip(),
-                        'Pack':     m.get("pack", "").strip(),
-                        'strength': extract_strength(name_str)
-                    })
+        temp_matcher = _matcher
 
-            temp_searcher = FuzzySearcher(temp_path)
-            temp_searcher.load()
-            temp_matcher  = FastMatcher(temp_searcher, model_key="gemma4_2b")
-            temp_matcher.load_catalog()
+        import threading
 
-            # ── Calculate optimal workers & initialize Engine Pool ──────────
-            pool_size = calculate_optimal_workers("gemma4_2b")
-            print(f"[Batch Match] Dynamically using {pool_size} workers based on GPU VRAM availability.")
-            
-            engine_pool = EnginePool(model_key="gemma4_2b", size=pool_size)
-            engine_pool.populate()
+        pool_size  = _engine_pool.size
+        engine_pool = _engine_pool
 
-            mappings  = []   # matched items
-            unmatched = []   # products with no master match
-            total    = len(products)
-            t_start  = time.time()
+        mappings  = []   # matched items
+        unmatched = []   # products with no master match
+        total     = len(products)
+        t_start   = time.time()
 
-            # ── Shared state for the daemon reporter thread ───────────────────
-            _state       = {"processed": 0, "matched": 0}
-            _done_event  = threading.Event()
-            counter_lock = threading.Lock()
+        # ── Shared state for the daemon reporter thread ───────────────────
+        _state       = {"processed": 0, "matched": 0}
+        _done_event  = threading.Event()
+        counter_lock = threading.Lock()
 
-            def _http_push(processed, matched):
-                """Fire a single HTTP POST to the backend progress endpoint."""
-                if not progress_url:
-                    return
-                import urllib.request as _req, json as _json
-                elapsed = time.time() - t_start
-                rate    = processed / elapsed if elapsed > 0 else 0
-                eta_s   = (total - processed) / rate if rate > 0 else 0
-                body = _json.dumps({
-                    "job_id":      job_id,
-                    "secret":      signal_secret,
-                    "processed":   processed,
-                    "total":       total,
-                    "matched":     matched,
-                    "eta_seconds": round(eta_s, 1),
-                }).encode()
-                try:
-                    req = _req.Request(
-                        progress_url, data=body,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with _req.urlopen(req, timeout=5):
-                        pass
-                except Exception as _e:
-                    print(f"[Progress] HTTP push failed: {_e}")
-
-            def _reporter_thread():
-                """
-                Daemon thread: fires a progress callback every 30 s.
-                Never touches the match loop — reads shared counters only.
-                Wakes early when _done_event is set (job finished/failed).
-                """
-                INTERVAL = 30  # seconds between callbacks
-                while not _done_event.wait(INTERVAL):
-                    _http_push(_state["processed"], _state["matched"])
-                # Final push on completion
-                _http_push(_state["processed"], _state["matched"])
-
-            # Start reporter as a daemon so it dies if the process exits
-            reporter = threading.Thread(target=_reporter_thread, daemon=True)
-            reporter.start()
-
-            # Worker function for parallel execution
-            def process_product(prod):
-                prod_name = prod.get("name", "").strip()
-                prod_pack = prod.get("pack", "").strip()
-                prod_comp = prod.get("company", "").strip()
-                prod_code = prod.get("code", "").strip()
-
-                engine = engine_pool.lease()
-                try:
-                    res_match = temp_matcher.match(
-                        f"{prod_name} {prod_pack}".strip(),
-                        name=prod_name, pack=prod_pack, compname=prod_comp,
-                        engine=engine
-                    )
-                finally:
-                    engine_pool.release(engine)
-
-                if res_match:
-                    conf = compute_confidence(
-                        prod_name,
-                        res_match['name'],
-                        res_match.get('brand', ''),
-                        prod_pack,
-                        res_match.get('pack', '')
-                    )
-                    mappings.append({
-                        "vendor_code":      prod_code,
-                        "master_id":        res_match["code"],
-                        "product_name":     prod_name,
-                        "company":          prod_comp,
-                        "pack":             prod_pack,
-                        "matched_name":     res_match["name"],
-                        "matched_pack":     res_match.get("pack", ""),
-                        "matched_company":  res_match.get("brand", ""),
-                        "source":           "gpu_ai",
-                        "confidence":       float(conf)
-                    })
-                else:
-                    unmatched.append({
-                        "vendor_code":  prod_code,
-                        "product_name": prod_name,
-                        "company":      prod_comp,
-                        "pack":         prod_pack,
-                    })
-
-                with counter_lock:
-                    _state["processed"] += 1
-                    _state["matched"]    = len(mappings)
-
-            # ── Main matching loop (Parallel ThreadPoolExecutor) ──────────────
+        def _http_push(processed, matched):
+            """Fire a single HTTP POST to the backend progress endpoint."""
+            if not progress_url:
+                return
+            import urllib.request as _req, json as _json
+            elapsed = time.time() - t_start
+            rate    = processed / elapsed if elapsed > 0 else 0
+            eta_s   = (total - processed) / rate if rate > 0 else 0
+            body = _json.dumps({
+                "job_id":      job_id,
+                "secret":      signal_secret,
+                "processed":   processed,
+                "total":       total,
+                "matched":     matched,
+                "eta_seconds": round(eta_s, 1),
+            }).encode()
             try:
-                with ThreadPoolExecutor(max_workers=pool_size) as executor:
-                    executor.map(process_product, products)
-            finally:
-                # Signal daemon to fire its final push and exit cleanly
-                _done_event.set()
-                reporter.join(timeout=10)
-                # Clean up engine pool and free VRAM
-                try:
-                    del engine_pool
-                    import gc
-                    gc.collect()
-                except Exception:
+                req = _req.Request(
+                    progress_url, data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _req.urlopen(req, timeout=5):
                     pass
+            except Exception as _e:
+                print(f"[Progress] HTTP push failed: {_e}")
 
-            return jsonify({"mappings": mappings, "unmatched": unmatched})
+        def _reporter_thread():
+            """
+            Daemon thread: fires a progress callback every 30 s.
+            Never touches the match loop — reads shared counters only.
+            Wakes early when _done_event is set (job finished/failed).
+            """
+            INTERVAL = 30
+            while not _done_event.wait(INTERVAL):
+                _http_push(_state["processed"], _state["matched"])
+            _http_push(_state["processed"], _state["matched"])
 
-        except Exception as e:
-            return jsonify({"error": f"Batch match failed: {str(e)}"}), 500
-        finally:
+        reporter = threading.Thread(target=_reporter_thread, daemon=True)
+        reporter.start()
+
+        def process_product(prod):
+            prod_name = prod.get("name", "").strip()
+            prod_pack = prod.get("pack", "").strip()
+            prod_comp = prod.get("company", "").strip()
+            prod_code = prod.get("code", "").strip()
+
+            engine = engine_pool.lease()
             try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+                res_match = temp_matcher.match(
+                    f"{prod_name} {prod_pack}".strip(),
+                    name=prod_name, pack=prod_pack, compname=prod_comp,
+                    engine=engine
+                )
+            finally:
+                engine_pool.release(engine)
+
+            if res_match:
+                conf = compute_confidence(
+                    prod_name,
+                    res_match['name'],
+                    res_match.get('brand', ''),
+                    prod_pack,
+                    res_match.get('pack', '')
+                )
+                mappings.append({
+                    "vendor_code":      prod_code,
+                    "master_id":        res_match["code"],
+                    "product_name":     prod_name,
+                    "company":          prod_comp,
+                    "pack":             prod_pack,
+                    "matched_name":     res_match["name"],
+                    "matched_pack":     res_match.get("pack", ""),
+                    "matched_company":  res_match.get("brand", ""),
+                    "source":           "gpu_ai",
+                    "confidence":       float(conf)
+                })
+            else:
+                cand_results, _ = _searcher.search(
+                    f"{prod_name} {prod_pack}".strip(), pack=prod_pack, compname=prod_comp, top_k=5
+                )
+                unmatched.append({
+                    "vendor_code":  prod_code,
+                    "product_name": prod_name,
+                    "company":      prod_comp,
+                    "pack":         prod_pack,
+                    "candidates": [
+                        {
+                            "master_id": r["code"],
+                            "name": r["name"],
+                            "company": r.get("compname", ""),
+                            "pack": r.get("pack", ""),
+                            "score": r.get("final_score", 0),
+                        }
+                        for r in cand_results
+                    ],
+                })
+
+            with counter_lock:
+                _state["processed"] += 1
+                _state["matched"]    = len(mappings)
+
+        # ── Main matching loop (Parallel ThreadPoolExecutor) ──────────────
+        try:
+            with ThreadPoolExecutor(max_workers=pool_size) as executor:
+                executor.map(process_product, products)
+        finally:
+            _done_event.set()
+            reporter.join(timeout=10)
+
+        return jsonify({"mappings": mappings, "unmatched": unmatched})
 
     # Single match mode (legacy/original compatibility)
-    name = data.get("name", "").strip()
-    pack = data.get("pack", "").strip()
+    name     = data.get("name", "").strip()
+    pack     = data.get("pack", "").strip()
     compname = data.get("company", "").strip() or data.get("compname", "").strip()
-    query = data.get("query", "").strip()
+    query    = data.get("query", "").strip()
 
     if not query:
         query = f"{name} {pack}".strip()
@@ -975,54 +967,111 @@ def search_item():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "mode": "standalone_fast"})
+    if _searcher is None or _matcher is None or _engine_pool is None:
+        return jsonify({"status": "initialising"}), 503
+    return jsonify({"status": "ok", "mode": "standalone_fast", "workers": _engine_pool.size})
 
 def main():
     global _searcher, _matcher
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Standalone REST API Server")
-    parser.add_argument("--csv", type=str, default="", help="Path to catalog CSV")
+    parser.add_argument("--csv",         type=str, default="", help="Path to catalog CSV (legacy fallback)")
+    parser.add_argument("--backend-url", type=str, default="", help="Backend base URL to fetch master medicines from")
+    parser.add_argument("--secret",      type=str, default="", help="GPU_SIGNAL_SECRET shared with backend")
     args = parser.parse_args()
-    
-    csv_path = args.csv
-    if not csv_path:
-        # Check next to the script or inside parent
-        user_home = os.path.expanduser("~")
-        candidate_paths = [
-            os.path.join(BASE_DIR, "Item_export_2026-05-29_17-33-30.csv"),
-            os.path.join(os.path.dirname(BASE_DIR), "Item_export_2026-05-29_17-33-30.csv"),
-            os.path.join(user_home, "Downloads", "Item_export_2026-05-29_17-33-30.csv"),
-            os.path.join(user_home, "Downloads", "item_export_2026-05-30_09-08-22.csv"),
-            os.path.join(os.path.dirname(sys.executable), "Item_export_2026-05-29_17-33-30.csv"),
-            os.path.join(os.getcwd(), "Item_export_2026-05-29_17-33-30.csv"),
-        ]
-        for p in candidate_paths:
-            if os.path.exists(p):
-                csv_path = p
-                break
-                
-    if not csv_path or not os.path.exists(csv_path):
-        print(f"Error: Unified CSV database not found.")
-        sys.exit(1)
-        
-    print(f"Loading search database from: {csv_path}...")
-    _searcher = FuzzySearcher(csv_path=csv_path)
-    _searcher.load()
-    
+
+    # ── Option A: fetch master medicines from backend API ─────────────────────
+    if args.backend_url and args.secret:
+        import urllib.request as _req, json as _json, tempfile, csv
+        catalog_url = f"{args.backend_url.rstrip('/')}/medicine-matching/admin/gpu-match/catalog?secret={args.secret}"
+        print(f"[Startup] Fetching master medicines from backend: {catalog_url}...")
+        try:
+            with _req.urlopen(catalog_url, timeout=120) as resp:
+                raw = _json.loads(resp.read())
+            medicines = raw.get("catalog", [])
+            print(f"[Startup] Received {len(medicines):,} master medicines from backend.")
+        except Exception as e:
+            print(f"[Startup] ERROR: Failed to fetch catalog from backend: {e}")
+            sys.exit(1)
+
+        # Write to a temp CSV so FuzzySearcher can load it
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+        try:
+            with open(tmp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for m in medicines:
+                    name_str = (m.get("name") or "").strip()
+                    writer.writerow({
+                        'code':     m.get("master_id") or m.get("code") or "",
+                        'name':     name_str,
+                        'Compname': (m.get("company") or "").strip(),
+                        'Pack':     (m.get("pack") or "").strip(),
+                        'strength': extract_strength(name_str),
+                    })
+            print(f"[Startup] Building FuzzySearcher index from {len(medicines):,} medicines...")
+            _searcher = FuzzySearcher(csv_path=tmp_path)
+            _searcher.load()
+        finally:
+            import os as _os
+            try: _os.unlink(tmp_path)
+            except Exception: pass
+
+    # ── Option B: legacy CSV path ─────────────────────────────────────────────
+    else:
+        csv_path = args.csv
+        if not csv_path:
+            user_home = os.path.expanduser("~")
+            candidate_paths = [
+                os.path.join(BASE_DIR, "Item_export_2026-05-29_17-33-30.csv"),
+                os.path.join(os.path.dirname(BASE_DIR), "Item_export_2026-05-29_17-33-30.csv"),
+                os.path.join(user_home, "Downloads", "Item_export_2026-05-29_17-33-30.csv"),
+                os.path.join(user_home, "Downloads", "item_export_2026-05-30_09-08-22.csv"),
+                os.path.join(os.path.dirname(sys.executable), "Item_export_2026-05-29_17-33-30.csv"),
+                os.path.join(os.getcwd(), "Item_export_2026-05-29_17-33-30.csv"),
+            ]
+            for p in candidate_paths:
+                if os.path.exists(p):
+                    csv_path = p
+                    break
+
+        if not csv_path or not os.path.exists(csv_path):
+            print(f"Error: Unified CSV database not found. Pass --backend-url and --secret to fetch from backend.")
+            sys.exit(1)
+
+        print(f"Loading search database from: {csv_path}...")
+        _searcher = FuzzySearcher(csv_path=csv_path)
+        _searcher.load()
+
     _matcher = FastMatcher(_searcher)
     _matcher.load_catalog()
-    
+
     # Check if AI model is available
     from qwen3_engine.config import MODEL_REGISTRY, DEFAULT_MODEL
     model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
     model_file = os.path.join(model_dir, MODEL_REGISTRY[DEFAULT_MODEL]["filename"])
     if os.path.exists(model_file):
-        print("✓ AI model found — LLM fallback enabled (lazy load on first miss).")
+        print("✓ AI model found — LLM fallback enabled.")
     else:
         print("⚠ AI model not found — running heuristic-only mode.")
 
-    print("✓ Standalone fast server listening on port 8080...")
+    # ── Pre-load engine pool in background so health returns 503 until ready ──
+    def _preload_pool():
+        global _engine_pool
+        from qwen3_engine.config import N_CTX_MATCHER
+        pool_size = calculate_optimal_workers("gemma4_2b")
+        print(f"[Startup] Pre-loading engine pool: {pool_size} workers (n_ctx={N_CTX_MATCHER})...")
+        pool = EnginePool(model_key="gemma4_2b", size=pool_size)
+        pool.populate()
+        _engine_pool = pool
+        print(f"[Startup] Engine pool ready — {pool_size} workers loaded. Health now returns 200.")
+
+    import threading as _threading
+    _threading.Thread(target=_preload_pool, daemon=True).start()
+
+    print("✓ Standalone fast server listening on port 8080 (pool loading in background)...")
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
 
 if __name__ == "__main__":
