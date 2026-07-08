@@ -1037,9 +1037,21 @@ def main():
     # ── Pre-load engine pool in background so health returns 503 until ready ──
     def _preload_pool():
         global _engine_pool
-        from qwen3_engine.config import N_CTX_MATCHER
+        from qwen3_engine.config import N_CTX_MATCHER, MODEL_REGISTRY, DEFAULT_MODEL
         pool_size = calculate_optimal_workers("gemma4_2b")
         print(f"[Startup] Pre-loading engine pool: {pool_size} workers (n_ctx={N_CTX_MATCHER})...")
+
+        # ── Pre-warm: read model file into OS RAM cache once ──
+        # This makes all workers load from RAM (1.6s each) instead of cold disk (137s for first worker)
+        if os.path.exists(model_file):
+            model_size_mb = os.path.getsize(model_file) / (1024 * 1024)
+            print(f"[Startup] Pre-warming disk cache: reading {model_size_mb:.0f}MB model into RAM...")
+            t_warm = time.time()
+            with open(model_file, 'rb') as f:
+                while f.read(64 * 1024 * 1024):  # Read in 64MB chunks
+                    pass
+            print(f"[Startup] Disk cache warm in {time.time()-t_warm:.1f}s — all workers will load from RAM.")
+
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
