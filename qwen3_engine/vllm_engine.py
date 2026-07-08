@@ -7,12 +7,12 @@ Qwen3Engine + llama-cpp-python directly and are untouched.
 import requests
 from requests.adapters import HTTPAdapter
 
-from qwen3_engine.config import VLLM_BASE_URL, VLLM_MODEL_NAME, VLLM_MAX_WORKERS
+from qwen3_engine.config import LLAMA_SERVER_BASE_URL, LLAMA_SERVER_MODEL, LLAMA_SERVER_MAX_WORKERS
 
 # One shared session with a large connection pool — all worker threads
 # reuse it concurrently instead of opening a new TCP connection per request.
 _session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=VLLM_MAX_WORKERS, pool_maxsize=VLLM_MAX_WORKERS)
+_adapter = HTTPAdapter(pool_connections=LLAMA_SERVER_MAX_WORKERS, pool_maxsize=LLAMA_SERVER_MAX_WORKERS)
 _session.mount("http://", _adapter)
 _session.mount("https://", _adapter)
 
@@ -24,8 +24,8 @@ class VLLMEngine:
     server, which does its own continuous batching on the GPU."""
 
     def __init__(self, base_url: str = None, model_name: str = None, system_prompt: str = ""):
-        self.base_url = (base_url or VLLM_BASE_URL).rstrip("/")
-        self.model_name = model_name or VLLM_MODEL_NAME
+        self.base_url = (base_url or LLAMA_SERVER_BASE_URL).rstrip("/")
+        self.model_name = model_name or LLAMA_SERVER_MODEL
         self.system_prompt = system_prompt
         self._ready = False
 

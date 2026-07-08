@@ -1,0 +1,788 @@
+canIpForward: false
+confidentialInstanceConfig:
+  enableConfidentialCompute: false
+cpuPlatform: Unknown CPU Platform
+creationTimestamp: '2026-06-12T00:59:46.996-07:00'
+deletionProtection: false
+description: ''
+disks:
+- autoDelete: true
+  boot: true
+  deviceName: instance-20260612-075658
+  diskSizeGb: 50
+  guestOsFeatures:
+  - type: UEFI_COMPATIBLE
+  - type: VIRTIO_SCSI_MULTIQUEUE
+  - type: GVNIC
+  - type: SEV_CAPABLE
+  - type: SEV_LIVE_MIGRATABLE_V2
+  index: 0
+  interface: SCSI
+  kind: compute#attachedDisk
+  licenses:
+  - https://www.googleapis.com/compute/v1/projects/debian-cloud/global/licenses/debian-12-bookworm
+  mode: READ_WRITE
+  source: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/zones/us-central1-a/disks/instance-20260612-075658
+  type: PERSISTENT
+displayDevice:
+  enableDisplay: false
+fingerprint: 3fshOIksCpw=
+guestAccelerators:
+- acceleratorCount: 1
+  acceleratorType: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/zones/us-central1-a/acceleratorTypes/nvidia-a100-80gb
+id: 1579078191493284511
+keyRevocationActionType: NONE
+kind: compute#instance
+labelFingerprint: u1i0GMcZHVI=
+labels:
+  goog-ops-agent-policy: v2-template-1-7-0
+lastStartTimestamp: '2026-06-20T06:18:43.465-07:00'
+lastStopTimestamp: '2026-06-20T09:20:43.018-07:00'
+machineType: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/zones/us-central1-a/machineTypes/a2-ultragpu-1g
+metadata:
+  fingerprint: 7EviWv-nEx0=
+  items:
+  - key: backend_url
+    value: https://test.embolo.in/api
+  - key: enable-osconfig
+    value: 'TRUE'
+  - key: fast_server_code
+    value: "import os\nimport sys\nimport time\nimport re\nimport json\nimport subprocess\n\
+      import queue\nfrom concurrent.futures import ThreadPoolExecutor\nfrom flask\
+      \ import Flask, request, jsonify\nfrom flask_cors import CORS\nfrom rapidfuzz\
+      \ import process, fuzz\nfrom qwen3_engine.searcher import FuzzySearcher\nfrom\
+      \ qwen3_engine.pharma_data import formulations_compatible\n\n# \u2500\u2500\u2500\
+      \ GPU Concurrency & Engine Pool Helpers \u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndef get_free_gpu_memory()\
+      \ -> int:\n    \"\"\"Returns free GPU memory in MB, or 0 if no GPU/nvidia-smi\
+      \ is available.\"\"\"\n    try:\n        res = subprocess.run(\n           \
+      \ [\"nvidia-smi\", \"--query-gpu=memory.free\", \"--format=csv,noheader,nounits\"\
+      ],\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n\
+      \            text=True,\n            check=True\n        )\n        out = res.stdout.strip()\n\
+      \        if out:\n            lines = [int(x) for x in out.splitlines() if x.strip().isdigit()]\n\
+      \            return sum(lines) if lines else 0\n    except Exception:\n    \
+      \    pass\n    return 0\n\ndef calculate_optimal_workers(model_key: str) ->\
+      \ int:\n    \"\"\"Dynamically estimates optimal worker pool size based on available\
+      \ GPU VRAM.\"\"\"\n    from qwen3_engine.config import MODEL_REGISTRY\n    if\
+      \ model_key not in MODEL_REGISTRY:\n        return 1\n    \n    cfg = MODEL_REGISTRY[model_key]\n\
+      \    model_size_mb = cfg.get(\"size_mb\", 1000)\n    # Quantized GGUF models\
+      \ take roughly 1.15x size in VRAM, plus ~300MB KV Cache / overhead\n    vram_per_worker\
+      \ = int(model_size_mb * 1.15 + 300)\n    \n    free_mem = get_free_gpu_memory()\n\
+      \    if free_mem <= 0:\n        # CPU-only fallback: use half of available CPU\
+      \ cores\n        import multiprocessing\n        return max(1, multiprocessing.cpu_count()\
+      \ // 2)\n    \n    # Reserve 3.5GB buffer VRAM for driver overhead, backend\
+      \ server, and context batches\n    buffer_mem = 3500\n    available_mem = free_mem\
+      \ - buffer_mem\n    if available_mem <= 0:\n        return 1\n        \n   \
+      \ optimal_workers = available_mem // vram_per_worker\n    return max(1, int(optimal_workers))\n\
+      \nclass EnginePool:\n    \"\"\"Thread-safe pool of independent model instances\
+      \ to prevent concurrency race conditions.\"\"\"\n    def __init__(self, model_key:\
+      \ str, size: int):\n        self.model_key = model_key\n        self.size =\
+      \ size\n        self.pool = queue.Queue()\n        \n    def populate(self):\n\
+      \        from qwen3_engine.engine import Qwen3Engine\n        from qwen3_engine.config\
+      \ import N_CTX_MATCHER\n        print(f\"[EnginePool] Initializing {self.size}\
+      \ workers for model '{self.model_key}'...\")\n        for i in range(self.size):\n\
+      \            t0 = time.time()\n            engine = Qwen3Engine(model_key=self.model_key)\n\
+      \            engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else\
+      \ 2048)\n            self.pool.put(engine)\n            print(f\"  \u2713 Worker\
+      \ {i+1}/{self.size} loaded in {time.time()-t0:.1f}s\")\n            \n    def\
+      \ lease(self):\n        return self.pool.get()\n        \n    def release(self,\
+      \ engine):\n        self.pool.put(engine)\n\n# \u2500\u2500\u2500 Batch Match\
+      \ Helper Functions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndef\
+      \ extract_strength(name_str):\n    if not isinstance(name_str, str):\n     \
+      \   return \"\"\n    # Compound doses like \"500/125MG\" or \"875/125\" \u2014\
+      \ return full slash expression\n    # so both components end up in c_nums during\
+      \ strength matching.\n    compound = re.search(r'\\b\\d+(?:\\.\\d+)?/\\d+(?:\\\
+      .\\d+)?\\s*(?:mg|ml|gm|g|mcg)?\\b', name_str, re.IGNORECASE)\n    if compound:\n\
+      \        return compound.group(0)\n    match = re.search(r'\\b\\d+(?:\\.\\d+)?\\\
+      s*(?:mg|ml|gm|g|mcg|cap|tab)\\b', name_str, re.IGNORECASE)\n    if match:\n\
+      \        return match.group(0)\n    match_num = re.search(r'\\b\\d+(?:\\.\\\
+      d+)?\\b', name_str)\n    if match_num:\n        val = match_num.group(0)\n \
+      \       try:\n            if float(val) <= 10.0 and '.' not in val:\n      \
+      \          return \"\"\n        except ValueError:\n            pass\n     \
+      \   return val\n    return \"\"\n\ndef compute_confidence(query_name, matched_name,\
+      \ matched_brand, query_pack, matched_pack):\n    if not matched_name:\n    \
+      \    return 0\n    q = query_name.lower().strip()\n    m = matched_name.lower().strip()\n\
+      \    q_words = re.sub(r'[^a-z0-9\\s]', '', q).split()\n    m_words = re.sub(r'[^a-z0-9\\\
+      s]', '', m).split()\n    q_brand = q_words[0] if q_words else \"\"\n    m_brand\
+      \ = m_words[0] if m_words else \"\"\n    if len(q_brand) <= 2 and len(q_words)\
+      \ > 1:\n        q_brand = q_words[1]\n    brand_score = fuzz.ratio(q_brand,\
+      \ m_brand)\n    full_score = fuzz.token_sort_ratio(q, m)\n    q_nums = set(re.findall(r'\\\
+      d+\\.?\\d*', q))\n    m_nums = set(re.findall(r'\\d+\\.?\\d*', m))\n    PACK_NUMS\
+      \ = {'1','2','3','4','5','6','7','8','9','10'}\n    q_strengths = q_nums - PACK_NUMS\n\
+      \    m_strengths = m_nums - PACK_NUMS\n    strength_bonus = 0\n    if q_strengths\
+      \ and m_strengths:\n        if q_strengths & m_strengths:\n            strength_bonus\
+      \ = 10\n        else:\n            strength_bonus = -15\n    confidence = (brand_score\
+      \ * 0.5) + (full_score * 0.4) + strength_bonus\n    return max(0, min(100, round(confidence)))\n\
+      \n# \u2500\u2500\u2500 Company Compatibility Helper Functions \u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \ndef clean_company_name(name_str: str) -> str:\n    if not name_str:\n    \
+      \    return \"\"\n    name_str = name_str.lower().strip()\n    if name_str in\
+      \ {\"\", \"--\", \"none\", \"null\", \"nan\", \"undefined\", \"unknown\", \"\
+      -\"}:\n        return \"\"\n    # Remove common punctuation\n    name_str =\
+      \ re.sub(r'[^a-z0-9\\s]', ' ', name_str)\n    # Remove common business suffixes\n\
+      \    stopwords = {\n        'laboratories', 'laboratory', 'labs', 'lab', 'pharma',\
+      \ 'pharmaceuticals', 'pharmaceutical', 'therapeutics', \n        'healthcare',\
+      \ 'lifesciences', 'life', 'sciences', 'pvt', 'ltd', 'private', 'limited', 'india',\
+      \ 'inc', 'corp', \n        'corporation', 'co', 'gmbh', 'sa', 'ag', 'limited',\
+      \ 'ltd'\n    }\n    words = name_str.split()\n    cleaned_words = [w for w in\
+      \ words if w not in stopwords]\n    if not cleaned_words:\n        cleaned_words\
+      \ = words\n    return \" \".join(cleaned_words).strip()\n\ndef companies_compatible(q_comp:\
+      \ str, c_comp: str) -> bool:\n    q_clean = clean_company_name(q_comp)\n   \
+      \ c_clean = clean_company_name(c_comp)\n    \n    if not q_clean or not c_clean:\n\
+      \        return True  # If either side is missing, it's compatible (no info\
+      \ to conflict)\n        \n    if q_clean == c_clean:\n        return True\n\
+      \        \n    q_words = set(q_clean.split())\n    c_words = set(c_clean.split())\n\
+      \    \n    # Overlap of non-trivial words (length >= 3)\n    non_trivial_overlap\
+      \ = {w for w in (q_words & c_words) if len(w) >= 3}\n    if non_trivial_overlap:\n\
+      \        return True\n        \n    # Fuzzy ratio match\n    score = fuzz.ratio(q_clean,\
+      \ c_clean)\n    if score >= 75:\n        return True\n        \n    # Partial\
+      \ ratio match for substrings\n    if len(q_clean) >= 4 and len(c_clean) >= 4:\n\
+      \        partial = fuzz.partial_ratio(q_clean, c_clean)\n        if partial\
+      \ >= 85:\n            return True\n            \n    return False\n\nBASE_DIR\
+      \ = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))\n\n\
+      app = Flask(__name__)\nCORS(app)\n\n_searcher = None\n_llm_engines = {}   #\
+      \ Lazy-loaded AI engines for fallback: model_key -> Qwen3Engine\n\ndef is_abbreviation(abbrev:\
+      \ str, full: str) -> bool:\n    abbrev = abbrev.lower().strip()\n    full =\
+      \ full.lower().strip()\n    if len(abbrev) < 3 or not full:\n        return\
+      \ False\n    if abbrev[0] != full[0]:\n        return False\n    it = iter(full)\n\
+      \    return all(char in it for char in abbrev)\n\nclass FastMatcher:\n    def\
+      \ __init__(self, searcher_instance, model_key: str = \"gemma4_2b\"):\n     \
+      \   self.searcher = searcher_instance\n        self.catalog = []\n        self.model_key\
+      \ = model_key\n        \n    def load_catalog(self):\n        self.catalog =\
+      \ []\n        for cand in self.searcher.catalog:\n            self.catalog.append({\n\
+      \                \"code\": cand[\"code\"],\n                \"name\": cand[\"\
+      name\"],\n                \"brand\": cand[\"compname\"],\n                \"\
+      pack\": cand[\"pack\"],\n                \"strength\": cand[\"strength\"],\n\
+      \            })\n\n    def normalize_text(self, text: str) -> str:\n       \
+      \ text = text.lower()\n        # Replace separators with spaces\n        text\
+      \ = text.replace(\"-\", \" \").replace(\"/\", \" \").replace(\",\", \" \")\n\
+      \        # Split stuck numbers from words: PAN40 -> PAN 40, DOLO650 -> DOLO\
+      \ 650\n        text = re.sub(r'([a-z])([0-9])', r'\\1 \\2', text)\n        text\
+      \ = re.sub(r'([0-9])([a-z])', r'\\1 \\2', text)\n        # Remove formulation\
+      \ keywords\n        text = re.sub(r'\\b(tabs?|tablets?|inj(ection)?s?|caps?(ules?)?|susp(ension)?|syp|syrup|drops?|cream|ointment|gel|liq(uid)?|sol(ution)?)\\\
+      b', '', text)\n        # Remove all non-alphanumeric except spaces and dots\n\
+      \        text = re.sub(r'[^a-z0-9\\s\\.]', '', text)\n        tokens = text.split()\n\
+      \        # Strip leading pure-numeric vendor codes (e.g. \"001 PAN 40\" \u2192\
+      \ \"pan 40\")\n        # BUT stop if next token is short (\u22642 alpha chars)\
+      \ \u2014 that means the number IS part of\n        # the brand name, e.g. \"\
+      36 D\" or \"4 PH\" (after \"4ph\" is split by the regex above).\n        while\
+      \ tokens and re.match(r'^\\d+$', tokens[0]):\n            if len(tokens) > 1\
+      \ and sum(c.isalpha() for c in tokens[1]) >= 3:\n                tokens.pop(0)\n\
+      \            else:\n                break\n        return ' '.join(tokens)\n\
+      \n    def _clean_raw_query(self, text: str) -> str:\n        \"\"\"Clean the\
+      \ raw query for strength extraction: strip vendor codes, fix separators.\"\"\
+      \"\n        text = text.replace(\",\", \" \").replace(\"/\", \" \").replace(\"\
+      -\", \" \")\n        # Split stuck numbers: PAN40 -> PAN 40\n        text =\
+      \ re.sub(r'([a-zA-Z])([0-9])', r'\\1 \\2', text)\n        text = re.sub(r'([0-9])([a-zA-Z])',\
+      \ r'\\1 \\2', text)\n        # Remove trailing dots from numbers (650. -> 650)\n\
+      \        text = re.sub(r'(\\d)\\.(?!\\d)', r'\\1', text)\n        tokens = text.split()\n\
+      \        # Strip leading pure-numeric vendor codes, same guard as normalize_text:\n\
+      \        # only strip if the next token is a real word (\u22653 alpha chars).\n\
+      \        while tokens and re.match(r'^\\d+$', tokens[0]) and len(tokens[0])\
+      \ <= 3:\n            if len(tokens) > 1 and sum(c.isalpha() for c in tokens[1])\
+      \ >= 3:\n                tokens.pop(0)\n            else:\n                break\n\
+      \        return ' '.join(tokens)\n\n    def _has_unit_suffix(self, text: str,\
+      \ num: str) -> bool:\n        \"\"\"Check if a number in the text is followed\
+      \ by a unit suffix (mg, ml, etc.).\n        If so, it's a strength, not a pack\
+      \ count.\"\"\"\n        pattern = re.escape(num) + r'\\s*(?:mg|mcg|ml|gm|g|iu|units?)\\\
+      b'\n        return bool(re.search(pattern, text, re.IGNORECASE))\n\n    def\
+      \ validate_match(self, query: str, candidate: dict, name: str = \"\", compname:\
+      \ str = \"\", strict: bool = False) -> bool:\n        \"\"\"Validate a proposed\
+      \ match. In strict mode (AI fallback), thresholds are higher.\"\"\"\n      \
+      \  q_clean = self.normalize_text(query)\n        c_name_clean = self.normalize_text(candidate['name'])\n\
+      \        c_brand_clean = self.normalize_text(candidate['brand']) if candidate.get('brand')\
+      \ else \"\"\n        \n        q_words = q_clean.split()\n        if not q_words:\n\
+      \            return False\n        q_brand = q_words[0]\n        UNIT_AND_FORMULATION\
+      \ = {\n            'tab', 'tabs', 'tablet', 'tablets', 'cap', 'caps', 'capsule',\
+      \ 'capsules',\n            'inj', 'injection', 'syp', 'syrup', 'susp', 'suspension',\
+      \ 'ml', 'mg', 'gm', 'g', 'mcg',\n            'drop', 'drops', 'cream', 'oint',\
+      \ 'ointment', 'gel', 'lotion', 'vial', 'vials', 'amp', 'amps'\n        }\n \
+      \       if re.match(r'^\\d+$', q_brand) and len(q_words) > 1:\n            next_w\
+      \ = q_words[1]\n            alpha_count = sum(c.isalpha() for c in next_w)\n\
+      \            if alpha_count <= 2 and next_w not in UNIT_AND_FORMULATION:\n \
+      \               # Compound brand like \"36 D\" or \"4 PH\" \u2014 fuse into\
+      \ one token\n                q_brand = q_brand + next_w\n            elif alpha_count\
+      \ >= 3:\n                # Leading number was a vendor code; real brand is the\
+      \ next word\n                q_brand = next_w\n        elif len(q_brand) <=\
+      \ 2 and len(q_words) > 1:\n            next_word = q_words[1].lower()\n    \
+      \        is_num = bool(re.match(r'^\\d', next_word))\n            if not (is_num\
+      \ or next_word in UNIT_AND_FORMULATION):\n                q_brand = q_words[1]\n\
+      \            \n        q_brand_flat = q_brand.replace(\" \", \"\")\n       \
+      \ c_name_flat = c_name_clean.replace(\" \", \"\")\n        c_brand_flat = c_brand_clean.replace(\"\
+      \ \", \"\")\n        \n        # Check brand match \u2014 strict mode uses higher\
+      \ thresholds for AI fallback safety\n        brand_cutoff = 88 if strict else\
+      \ 85\n        min_substr_len = 4 if strict else 1\n        \n        is_abbrev_match\
+      \ = (\n            is_abbreviation(q_brand, c_name_clean) or\n            is_abbreviation(q_brand,\
+      \ c_brand_clean)\n        )\n        \n        brand_match = (\n           \
+      \ is_abbrev_match or\n            (len(q_brand) >= min_substr_len and q_brand\
+      \ in c_name_clean) or \n            (len(q_brand) >= min_substr_len and q_brand\
+      \ in c_brand_clean) or \n            (len(q_brand_flat) >= min_substr_len and\
+      \ q_brand_flat in c_name_flat) or\n            (len(c_name_flat) >= min_substr_len\
+      \ and c_name_flat in q_brand_flat) or\n            (c_brand_flat and len(q_brand_flat)\
+      \ >= min_substr_len and (q_brand_flat in c_brand_flat or c_brand_flat in q_brand_flat))\
+      \ or\n            process.extractOne(q_brand, c_name_clean.split(), scorer=fuzz.ratio,\
+      \ score_cutoff=brand_cutoff) is not None or\n            (c_brand_clean and\
+      \ process.extractOne(q_brand, c_brand_clean.split(), scorer=fuzz.ratio, score_cutoff=brand_cutoff)\
+      \ is not None)\n        )\n        # Fallback for vendor prefix codes (e.g.\
+      \ \"RS-PAN 40\" -> brand \"PAN\" is in query words)\n        if not brand_match:\n\
+      \            c_first_word = c_name_clean.split()[0] if c_name_clean.split()\
+      \ else \"\"\n            c_brand_first = c_brand_clean.split()[0] if c_brand_clean.split()\
+      \ else \"\"\n            if (c_first_word and len(c_first_word) >= 2 and c_first_word.isalpha()\
+      \ and c_first_word in q_words) or (c_brand_first and len(c_brand_first) >= 2\
+      \ and c_brand_first.isalpha() and c_brand_first in q_words):\n             \
+      \   brand_match = True\n            # In strict mode, also try the reverse:\
+      \ query first word in candidate\n            if strict and not brand_match:\n\
+      \                q_first = q_words[0] if q_words else \"\"\n               \
+      \ if q_first and len(q_first) >= 3 and q_first in c_name_clean:\n          \
+      \          brand_match = True\n\n        if not brand_match:\n            return\
+      \ False\n            \n        # Combo Suffix Validation Check\n        COMBO_SUFFIXES\
+      \ = {\n            'd', 'dsr', 'sr', 'xr', 'er', 'cr', 'mr', 'xl', 'la', 'plus',\
+      \ 'xt', 'tz', 'oz', 'h', 'at', 'am', 'lp', 'sp', \n            'ap', 'force',\
+      \ 'forte', 'fort', 'pd', 'kid', 'dc', 'as', 'sl', 'dt', 'ct', 'rt', 'mps', 'df',\
+      \ 'dx', 'ds', \n            'cv', 'lb', 'xp', 'f', 'e', 'k2', 'gold', 'mb',\
+      \ 'hs', 'at', 'aa', 'pr', 'od', 'fb', 'l', 'ax', 'snq', 'dp', \n           \
+      \ 'th', 'pg', 'nt', 'm', 'beta', 'tri', 'ch', 'ln', 't', 'o', 'av', 'd3'\n \
+      \       }\n        \n        def get_suffixes(text: str) -> set:\n         \
+      \   words = re.sub(r'[^a-z0-9\\s]', ' ', text.lower()).split()\n           \
+      \ return {w for w in words if w in COMBO_SUFFIXES}\n            \n        q_suffixes\
+      \ = get_suffixes(name if name else query)\n        c_suffixes = get_suffixes(candidate['name'])\n\
+      \        \n        if q_suffixes != c_suffixes:\n            return False\n\n\
+      \        # Smart Strength Validation Check\n        def clean_nums(text: str,\
+      \ pack_text: str = \"\") -> set:\n            text_lower = text.lower() + \"\
+      \ \" + pack_text.lower()\n            # Split stuck number+letter (e.g. \"125mg\"\
+      \ -> \"125 mg\") to guarantee word boundaries\n            text_lower = re.sub(r'([0-9])([a-z])',\
+      \ r'\\1 \\2', text_lower)\n            text_lower = re.sub(r'([a-z])([0-9])',\
+      \ r'\\1 \\2', text_lower)\n            text_clean = re.sub(r'\\b\\d+\\s*(?:tab|tabs|tablet|tablets|cap|caps|capsule|capsules|vial|vials|amp|amps|ampoule|ampoules|sachet|sachets|pc|pcs|piece|pieces|strip|strips|pack|packs|packet|packets|bottle|bottles|bot|tube|tubes|pair|pairs|set|sets|roll|rolls|s)\\\
+      b', ' ', text_lower)\n            nums = re.findall(r'\\b\\d+(?:\\.\\d+)?\\\
+      b', text_clean)\n            normalized = set()\n            for n in nums:\n\
+      \                try:\n                    val = float(n)\n                \
+      \    # Ignore very common small values like 1 or 2 if they are not followed\
+      \ by units\n                    if val in (1.0, 2.0) and not re.search(r'\\\
+      b' + re.escape(n) + r'\\s*(?:mg|ml|gm|g|mcg|iu|%)\\b', text_lower):\n      \
+      \                  continue\n                    if val.is_integer():\n    \
+      \                    normalized.add(str(int(val)))\n                    else:\n\
+      \                        normalized.add(str(val))\n                except ValueError:\n\
+      \                    normalized.add(n)\n            return normalized\n\n  \
+      \      q_strengths = clean_nums(name if name else query)\n        c_strengths\
+      \ = clean_nums(candidate['name'], candidate.get('strength', '') + ' ' + candidate.get('pack',\
+      \ ''))\n        \n        if q_strengths and c_strengths:\n            # ALL\
+      \ query strength components must appear in candidate.\n            # issubset\
+      \ catches compound-dose mismatches like \"500/125\" vs \"250/125\" \u2014\n\
+      \            # both share \"125\" but differ on \"500\" vs \"250\". A plain\
+      \ intersection would\n            # pass; issubset correctly rejects because\
+      \ \"500\" is missing from {\"250\",\"125\"}.\n            if not q_strengths.issubset(c_strengths):\n\
+      \                return False\n\n        # Comprehensive formulation compatibility\
+      \ check\n        if not formulations_compatible(query, candidate['name'] + \"\
+      \ \" + candidate['pack']):\n            return False\n\n        # Smart Company\
+      \ Compatibility check (always checked if input company is provided)\n      \
+      \  if compname and compname.strip() and compname.strip() not in ('--', 'none',\
+      \ 'null', 'nan'):\n            c_brand = candidate.get('brand', '') or ''\n\
+      \            if c_brand and not companies_compatible(compname, c_brand):\n \
+      \               return False\n\n        return True\n\n    def heuristic_match(self,\
+      \ query: str, candidates: list, name: str = \"\", compname: str = \"\") -> tuple:\n\
+      \        \"\"\"Try to find a match using heuristic rules.\n        Returns (match_dict,\
+      \ confidence_score) or (None, 0).\n        confidence_score is 0-100 based on\
+      \ brand similarity.\"\"\"\n        if not candidates:\n            return None,\
+      \ 0\n            \n        for cand in candidates:\n            q_clean = self.normalize_text(query)\n\
+      \            c_name_clean = self.normalize_text(cand['name'])\n            c_brand_clean\
+      \ = self.normalize_text(cand['brand']) if cand.get('brand') else \"\"\n    \
+      \        \n            strength_query = self._clean_raw_query(name if name else\
+      \ query)\n            q_nums = re.findall(r'\\d+\\.?\\d*', strength_query)\n\
+      \            c_nums = re.findall(r'\\d+\\.?\\d*', cand['name'] + \" \" + cand['strength'])\n\
+      \            \n            q_words = q_clean.split()\n            if not q_words:\n\
+      \                continue\n            q_brand = q_words[0]\n            if\
+      \ re.match(r'^\\d+$', q_brand) and len(q_words) > 1:\n                next_w\
+      \ = q_words[1]\n                alpha_count = sum(c.isalpha() for c in next_w)\n\
+      \                if alpha_count <= 2 and next_w.isalpha():\n               \
+      \     q_brand = q_brand + next_w  # compound brand: \"36d\", \"4ph\"\n     \
+      \           else:\n                    q_brand = next_w             # vendor\
+      \ code, use real brand word\n            elif len(q_brand) <= 2 and len(q_words)\
+      \ > 1:\n                q_brand = q_words[1]\n\n            c_words = c_name_clean.split()\n\
+      \            c_brand_words = c_brand_clean.split()\n\n            brand_exact\
+      \ = False\n            if c_words:\n                UNIT_SUFFIXES = {'mg', 'ml',\
+      \ 'mcg', 'gm', 'g', 'cap', 'tab', 'tabs', 'caps'}\n                # Detect\
+      \ compound num+letter brand in candidate (e.g. master \"36 D CAPS\" \u2192 \"\
+      36d\")\n                c_compound_brand = \"\"\n                if (re.match(r'^\\\
+      d+$', c_words[0]) and len(c_words) > 1\n                        and len(c_words[1])\
+      \ <= 2 and c_words[1].isalpha()):\n                    c_compound_brand = c_words[0]\
+      \ + c_words[1]\n                c_brand_words_no_num = [w for w in c_words if\
+      \ not w.isdigit() and w not in UNIT_SUFFIXES]\n                c_brand_flat\
+      \ = \"\".join(c_brand_words_no_num[:2]) if len(c_brand_words_no_num) >= 2 else\
+      \ \"\".join(c_brand_words_no_num)\n                \n                q_brand_words_no_num\
+      \ = [w for w in q_words if not w.isdigit() and w not in UNIT_SUFFIXES]\n   \
+      \             q_brand_flat = \"\".join(q_brand_words_no_num[:2]) if len(q_brand_words_no_num)\
+      \ >= 2 else \"\".join(q_brand_words_no_num)\n                \n            \
+      \    def _brands_similar(q_flat: str, c_flat: str) -> bool:\n              \
+      \      if q_flat == c_flat:\n                        return True\n         \
+      \           if fuzz.ratio(q_flat, c_flat) >= 78:\n                        return\
+      \ True\n                    # partial_ratio only if both brands are long enough\
+      \ (>=5 chars)\n                    # and with a stricter threshold to prevent\
+      \ cross-brand leaks\n                    if len(q_flat) >= 5 and len(c_flat)\
+      \ >= 5 and fuzz.partial_ratio(q_flat, c_flat) >= 90:\n                     \
+      \   return True\n                    return False\n\n                if (_brands_similar(q_brand_flat,\
+      \ c_brand_flat)\n                        or (c_brand_words_no_num and _brands_similar(q_brand_flat,\
+      \ c_brand_words_no_num[0]))\n                        or (c_compound_brand and\
+      \ _brands_similar(q_brand_flat, c_compound_brand))):\n                    brand_exact\
+      \ = True\n                elif c_brand_words:\n                    c_brand_words2_no_num\
+      \ = [w for w in c_brand_words if not w.isdigit() and w not in UNIT_SUFFIXES]\n\
+      \                    c_brand_flat2 = \"\".join(c_brand_words2_no_num[:2]) if\
+      \ len(c_brand_words2_no_num) >= 2 else \"\".join(c_brand_words2_no_num)\n  \
+      \                  # Skip company brand check if flat string is too short (e.g.\
+      \ '3M' -> 'm')\n                    if len(c_brand_flat2) >= 3 and (_brands_similar(q_brand_flat,\
+      \ c_brand_flat2) or (c_brand_words2_no_num and len(c_brand_words2_no_num[0])\
+      \ >= 3 and _brands_similar(q_brand_flat, c_brand_words2_no_num[0]))):\n    \
+      \                    brand_exact = True\n                        \n        \
+      \    # Fallback for vendor prefix codes (e.g. \"RS-PAN 40\" -> brand \"PAN\"\
+      \ is in query words)\n            if not brand_exact:\n                c_first_word\
+      \ = c_words[0] if c_words else \"\"\n                c_brand_first = c_brand_words[0]\
+      \ if c_brand_words else \"\"\n                if (c_first_word and len(c_first_word)\
+      \ >= 2 and c_first_word.isalpha() and c_first_word in q_words) or (c_brand_first\
+      \ and len(c_brand_first) >= 2 and c_brand_first.isalpha() and c_brand_first\
+      \ in q_words):\n                    brand_exact = True\n                   \
+      \     \n            # Strength matching \u2014 numbers with unit suffixes are\
+      \ ALWAYS strengths\n            PACK_COUNT_NUMS = {'1', '2', '3', '4', '5',\
+      \ '6', '7', '8', '9', '10'}\n            raw_q = name if name else query\n \
+      \           raw_c = cand['name'] + ' ' + cand['strength']\n            nums_match\
+      \ = False\n            if q_nums:\n                matched_num = False\n   \
+      \             for q_num in q_nums:\n                    if q_num in PACK_COUNT_NUMS\
+      \ and '.' not in q_num and not self._has_unit_suffix(raw_q, q_num):\n      \
+      \                  continue\n                    if q_num in c_nums:\n     \
+      \                   matched_num = True\n                        break\n    \
+      \            q_strengths = [n for n in q_nums if n not in PACK_COUNT_NUMS or\
+      \ '.' in n or self._has_unit_suffix(raw_q, n)]\n                if q_strengths:\n\
+      \                    if matched_num:\n                        nums_match = True\n\
+      \                else:\n                    c_strengths = [n for n in c_nums\
+      \ if n not in PACK_COUNT_NUMS or '.' in n or self._has_unit_suffix(raw_c, n)]\n\
+      \                    if not c_strengths:\n                        nums_match\
+      \ = True\n            else:\n                c_strengths = [n for n in c_nums\
+      \ if n not in PACK_COUNT_NUMS or '.' in n or self._has_unit_suffix(raw_c, n)]\n\
+      \                if not c_strengths:\n                    nums_match = True\n\
+      \n            # Comprehensive formulation compatibility check\n            formulation_match\
+      \ = formulations_compatible(query, cand['name'] + \" \" + cand['pack'])\n\n\
+      \            if brand_exact and nums_match and formulation_match:\n        \
+      \        if self.validate_match(query, cand, name=name, compname=compname):\n\
+      \                    # Calculate confidence score from brand similarity\n  \
+      \                  brand_score = fuzz.ratio(q_brand_flat, c_brand_flat)\n  \
+      \                  if c_brand_words_no_num:\n                        word_score\
+      \ = fuzz.ratio(q_brand_flat, c_brand_words_no_num[0])\n                    \
+      \    brand_score = max(brand_score, word_score)\n                    \n    \
+      \                # Company mismatch penalty on confidence\n                \
+      \    if compname and compname.strip() and compname.strip() != '--':\n      \
+      \                  c_company = self.normalize_text(cand.get('brand', '') or\
+      \ '')\n                        q_comp_norm = self.normalize_text(compname)\n\
+      \                        if q_comp_norm and c_company:\n                   \
+      \         comp_sim = fuzz.partial_ratio(q_comp_norm, c_company)\n          \
+      \                  if comp_sim < 30:\n                                brand_score\
+      \ = max(0, brand_score - 20)\n                    \n                    return\
+      \ cand, brand_score\n        return None, 0\n\n    def llm_rerank(self, query:\
+      \ str, candidates: list, name: str = \"\", compname: str = \"\", engine=None)\
+      \ -> dict:\n        \"\"\"AI fallback: ask the local LLM to pick the correct\
+      \ match.\"\"\"\n        if engine is None:\n            global _llm_engines\n\
+      \            engine = _llm_engines.get(self.model_key)\n            if engine\
+      \ is None:\n                try:\n                    from qwen3_engine.engine\
+      \ import Qwen3Engine\n                    from qwen3_engine.config import N_CTX_MATCHER\n\
+      \                    engine = Qwen3Engine(model_key=self.model_key)\n      \
+      \              print(f\"[AI] Loading local {self.model_key} LLM for fallback\
+      \ matching...\")\n                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER'\
+      \ in dir() else 2048)\n                    print(f\"[AI] \u2713 LLM {self.model_key}\
+      \ loaded successfully.\")\n                    _llm_engines[self.model_key]\
+      \ = engine\n                except Exception as e:\n                    print(f\"\
+      [AI] \u26A0 Could not load LLM {self.model_key}: {e}\")\n                  \
+      \  return None\n\n        if not engine or not engine.is_loaded():\n       \
+      \     return None\n\n        # Set system prompt unconditionally\n        if\
+      \ self.model_key == \"qwen3\":\n            engine.system_prompt = (\n     \
+      \           \"You are a strict data-matching engine. Match the wholesaler input\
+      \ to a candidate number (1-5) or return null. Respond ONLY with a JSON block,\
+      \ no explanations.\"\n            )\n        else:\n            engine.system_prompt\
+      \ = (\n                \"You are a strict, deterministic medical data-matching\
+      \ engine.\\n\"\n                \"Match a 'Wholesaler Input' to a candidate\
+      \ from the 'Master Candidates List'.\\n\\n\"\n                \"RULES (ALL must\
+      \ be satisfied):\\n\"\n                \"1. BRAND must match (typos OK: 'PNTOP'='PANTOP').\
+      \ Different brands = null.\\n\"\n                \"2. FORMULATION/PACK must\
+      \ match. Oral solids (TAB, CAP, S10, STRIP, 10TAB, 15TAB, etc.) are compatible.\
+      \ Incompatible formulations are mismatches.\\n\"\n                \"3. STRENGTH\
+      \ must match. 40\u2260400, 650\u2260500.\\n\"\n                \"4. Respond\
+      \ ONLY with a JSON block in the format: {\\\"match_number\\\": X} or {\\\"match_number\\\
+      \": null}. Do not write any analysis or explanations.\"\n            )\n\n \
+      \       if self.model_key == \"qwen3\":\n            # Simple, short prompt\
+      \ for Qwen3 0.6B to maximize speed and efficiency\n            prompt = (\n\
+      \                \"Wholesaler Input: PAN 40 TAB\\n\"\n                \"Master\
+      \ Candidates List:\\n\"\n                \"1. PAN 40 (Pack: 10 TAB, code: 101)\\\
+      n\"\n                \"2. PENTAB 40 (Pack: 1 PC, code: 102)\\n\"\n         \
+      \       \"Result:\\n\"\n                \"```json\\n\"\n                \"{\\\
+      \"match_number\\\": 1}\\n\"\n                \"```\\n\\n\"\n               \
+      \ \"Wholesaler Input: CALPOL 650\\n\"\n                \"Master Candidates List:\\\
+      n\"\n                \"1. CALPOL 500 (Pack: 15 TAB, code: 201)\\n\"\n      \
+      \          \"2. DOLO 650 (Pack: 15 TAB, code: 202)\\n\"\n                \"\
+      Result:\\n\"\n                \"```json\\n\"\n                \"{\\\"match_number\\\
+      \": null}\\n\"\n                \"```\\n\\n\"\n                f\"Wholesaler\
+      \ Input: {query}\\n\"\n                \"Master Candidates List:\\n\"\n    \
+      \        )\n            for i, cand in enumerate(candidates, 1):\n         \
+      \       prompt += f\"{i}. {cand['name']} (Pack: {cand['pack']}, code: {cand['code']})\\\
+      n\"\n            prompt += \"\\nResult:\"\n        else:\n            # Full\
+      \ detailed prompt for 1.7B and larger models, but without analysis output\n\
+      \            prompt = (\n                # Example 1: Correct match\n      \
+      \          \"Wholesaler Input: PAN 40 TAB (Company: SUN PHARMA)\\n\"\n     \
+      \           \"Master Candidates List:\\n\"\n                \"1. PAN 40 (Pack:\
+      \ 10 TAB, Company: SUN PHAR, code: 101)\\n\"\n                \"2. PENTAB 40\
+      \ (Pack: 1 PC, Company: TORQUE, code: 102)\\n\"\n                \"Result:\\\
+      n\"\n                '```json\\n{\"match_number\": 1}\\n```\\n\\n'\n       \
+      \         # Example 2: Strength mismatch \u2192 null\n                \"Wholesaler\
+      \ Input: CALPOL 650 (Company: GSK)\\n\"\n                \"Master Candidates\
+      \ List:\\n\"\n                \"1. CALPOL 500 (Pack: 15 TAB, Company: GSK, code:\
+      \ 201)\\n\"\n                \"2. DOLO 650 (Pack: 15 TAB, Company: MICRO, code:\
+      \ 202)\\n\"\n                \"Result:\\n\"\n                '```json\\n{\"\
+      match_number\": null}\\n```\\n\\n'\n                # Example 3: Formulation\
+      \ mismatch \u2192 null\n                \"Wholesaler Input: PAN 40 INJ (Company:\
+      \ SUN PHARMA)\\n\"\n                \"Master Candidates List:\\n\"\n       \
+      \         \"1. PAN 40 (Pack: 10 TAB, Company: SUN PHAR, code: 301)\\n\"\n  \
+      \              \"2. PAN D (Pack: 10 CAP, Company: SUN PHAR, code: 302)\\n\"\n\
+      \                \"Result:\\n\"\n                '```json\\n{\"match_number\"\
+      : null}\\n```\\n\\n'\n                # Example 4: Oral Pack matching (abbreviation\
+      \ compatibility)\n                \"Wholesaler Input: LIOFEN 10MG 10TAB (Company:\
+      \ INTAS)\\n\"\n                \"Master Candidates List:\\n\"\n            \
+      \    \"1. LIOFEN 10 (Pack: S10, Company: INTAS, code: M_3218)\\n\"\n       \
+      \         \"2. LIOFEN LIQUID (Pack: BL1, Company: INTAS, code: M_16166)\\n\"\
+      \n                \"Result:\\n\"\n                '```json\\n{\"match_number\"\
+      : 1}\\n```\\n\\n'\n                # Now the real query\n                f\"\
+      Wholesaler Input: {query}\"\n            )\n            if compname and compname.strip()\
+      \ and compname.strip() != '--':\n                prompt += f\" (Company: {compname.strip()})\"\
+      \n            prompt += \"\\nMaster Candidates List:\\n\"\n            for i,\
+      \ cand in enumerate(candidates, 1):\n                cand_company = cand.get('brand',\
+      \ '') or ''\n                prompt += f\"{i}. {cand['name']} (Pack: {cand['pack']},\
+      \ Company: {cand_company}, code: {cand['code']})\\n\"\n\n            prompt\
+      \ += \"\\nResult:\"\n\n        engine.clear_history()\n        response = engine.generate(prompt,\
+      \ max_tokens=100, temperature=0.0).strip()\n        print(f\"[AI] LLM Output:\\\
+      n{response}\")\n\n        try:\n            match = re.search(r'```json\\s*(\\\
+      {.*?\\})\\s*```', response, re.DOTALL)\n            if not match:\n        \
+      \        match = re.search(r'\\{.*\\}', response, re.DOTALL)\n            if\
+      \ match:\n                data = json.loads(match.group(1) if len(match.groups())\
+      \ > 0 else match.group(0))\n                match_num = data.get(\"match_number\"\
+      )\n                if match_num is not None and isinstance(match_num, int):\n\
+      \                    match_idx = match_num - 1\n                    if 0 <=\
+      \ match_idx < len(candidates):\n                        cand = candidates[match_idx]\n\
+      \                        if self.validate_match(query, cand, name=name, compname=compname,\
+      \ strict=True):\n                            return cand\n                 \
+      \       else:\n                            print(f\"[AI] Guardrail blocked:\
+      \ {cand['name']}\")\n        except Exception as e:\n            print(f\"[AI]\
+      \ Parse error: {e}\")\n        return None\n\n    def ai_verify(self, query:\
+      \ str, candidate: dict, name: str = \"\", compname: str = \"\", engine=None)\
+      \ -> bool:\n        \"\"\"AI verification: ask the LLM if a heuristic match\
+      \ is correct (yes/no).\n        Used for medium-confidence matches (80-94% brand\
+      \ similarity).\"\"\"\n        if engine is None:\n            global _llm_engines\n\
+      \            engine = _llm_engines.get(self.model_key)\n            if engine\
+      \ is None:\n                try:\n                    from qwen3_engine.engine\
+      \ import Qwen3Engine\n                    from qwen3_engine.config import N_CTX_MATCHER\n\
+      \                    engine = Qwen3Engine(model_key=self.model_key)\n      \
+      \              print(f\"[AI] Loading local {self.model_key} LLM for verification...\"\
+      )\n                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in\
+      \ dir() else 2048)\n                    print(f\"[AI] \u2713 LLM {self.model_key}\
+      \ loaded successfully.\")\n                    _llm_engines[self.model_key]\
+      \ = engine\n                except Exception as e:\n                    print(f\"\
+      [AI] \u2717 Failed to load LLM: {e}\")\n                    return False\n\n\
+      \        if not engine or not engine.is_loaded():\n            return False\n\
+      \n        # Set system prompt unconditionally\n        engine.system_prompt\
+      \ = \"You verify if two medicine descriptions refer to the same medicine. Answer\
+      \ ONLY with YES or NO.\"\n\n        cand_str = f\"{candidate['name']}\"\n  \
+      \      if candidate.get('strength'):\n            cand_str += f\" {candidate['strength']}\"\
+      \n        if candidate.get('pack'):\n            cand_str += f\" ({candidate['pack']})\"\
+      \n        if candidate.get('brand'):\n            cand_str += f\" [Company:\
+      \ {candidate['brand']}]\"\n\n        q_display = name if name else query\n \
+      \       if compname and compname.strip() and compname.strip() != '--':\n   \
+      \         q_display += f\" [Company: {compname}]\"\n\n        prompt = (\n \
+      \           \"You are a medical data verification assistant. Decide if the Chemist\
+      \ name and the Wholesaler name refer to the exact same medicine (same brand/drug,\
+      \ same strength, compatible formulation, same company).\\n\"\n            \"\
+      Trailing unit symbols like 'MG' can be omitted in one of them. Oral forms like\
+      \ tablets (TAB) and capsules (CAP) match each other.\\n\"\n            \"If\
+      \ the companies are clearly specified and different, the answer must be NO.\\\
+      n\\n\"\n            \"Examples:\\n\"\n            \"Chemist: CLOFRANIL 50MG\
+      \ TAB 10TAB [Company: INTAS]\\n\"\n            \"Wholesaler: CLOFRANIL 50 (S10)\
+      \ [Company: INTAS]\\n\"\n            \"Answer: YES\\n\\n\"\n            \"Chemist:\
+      \ PAN 40 TAB [Company: ALKEM]\\n\"\n            \"Wholesaler: PAN D (10 CAP)\
+      \ [Company: ALKEM]\\n\"\n            \"Answer: NO\\n\\n\"\n            \"Chemist:\
+      \ CALPOL 650 [Company: GSK]\\n\"\n            \"Wholesaler: CALPOL 500 (15 TAB)\
+      \ [Company: GSK]\\n\"\n            \"Answer: NO\\n\\n\"\n            \"Chemist:\
+      \ BRIV SYRUP 100ML [Company: DR REDDY]\\n\"\n            \"Wholesaler: BRIVATAB\
+      \ 100ML ORAL SOLUTION (100ML) [Company: HETERO]\\n\"\n            \"Answer:\
+      \ NO\\n\\n\"\n            f\"Chemist: {q_display}\\n\"\n            f\"Wholesaler:\
+      \ {cand_str}\\n\"\n            \"Answer:\"\n        )\n\n        engine.clear_history()\n\
+      \        response = engine.generate(prompt, max_tokens=20, temperature=0.0).strip().upper()\n\
+      \        print(f\"[AI Verify] '{q_display}' vs '{candidate['name']}' \u2192\
+      \ {response}\")\n\n        # Accept if AI says YES and guardrail also passes\n\
+      \        if 'YES' in response:\n            return True\n        return False\n\
+      \n\n    def match(self, query: str, name: str = \"\", pack: str = \"\", compname:\
+      \ str = \"\", engine=None) -> dict:\n        results, _ = self.searcher.search(name\
+      \ if name else query, pack=pack, top_k=5)\n        candidates = []\n       \
+      \ for r in results:\n            candidates.append({\n                \"code\"\
+      : r[\"code\"],\n                \"name\": r[\"name\"],\n                \"brand\"\
+      : r[\"compname\"],\n                \"pack\": r[\"pack\"],\n               \
+      \ \"strength\": r[\"strength\"],\n            })\n        \n        # Stage\
+      \ 1: Heuristic (fast, handles 85%+ correctly)\n        heur_match, confidence\
+      \ = self.heuristic_match(query, candidates, name=name, compname=compname)\n\
+      \        \n        if heur_match:\n            if confidence >= 95:\n      \
+      \          # HIGH confidence \u2192 accept directly\n                return\
+      \ heur_match\n            else:\n                # MEDIUM confidence \u2192\
+      \ ask AI to verify\n                print(f\"[AI Verify] Heuristic matched '{query}'\
+      \ \u2192 '{heur_match['name']}' (confidence={confidence}%). Verifying with AI...\"\
+      )\n                if self.ai_verify(query, heur_match, name=name, compname=compname,\
+      \ engine=engine):\n                    return heur_match\n                else:\n\
+      \                    print(f\"[AI Verify] Rejected: '{heur_match['name']}' is\
+      \ NOT the same as '{query}'\")\n\n        # Stage 2: AI fallback (slow but accurate\
+      \ for edge cases)\n        if candidates:\n            print(f\"[AI Fallback]\
+      \ Heuristic failed for '{query}'. Asking LLM...\")\n            ai_match = self.llm_rerank(query,\
+      \ candidates, name=name, compname=compname, engine=engine)\n            if ai_match:\n\
+      \                return ai_match\n\n        return None\n\n_matcher = None\n\
+      \n@app.route(\"/match\", methods=[\"POST\"])\ndef match_item():\n    data =\
+      \ request.get_json(silent=True) or {}\n\n    if \"products\" in data:\n    \
+      \    # \u2500\u2500 Batch match mode \u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\n        products        = data.get(\"products\", [])\n\
+      \        master_medicines= data.get(\"master_medicines\", [])\n\n        # Progress\
+      \ callback info (injected by backend)\n        backend_url   = (data.get(\"\
+      backend_url\") or \"\").rstrip(\"/\")\n        job_id        = (data.get(\"\
+      job_id\") or \"\").strip()\n        signal_secret = (data.get(\"signal_secret\"\
+      ) or \"\").strip()\n        progress_url  = (\n            f\"{backend_url}/medicine-matching/admin/gpu-match/{job_id}/gpu-progress\"\
+      \n            if backend_url and job_id and signal_secret else None\n      \
+      \  )\n\n        import tempfile, csv, threading\n\n        temp_fd, temp_path\
+      \ = tempfile.mkstemp(suffix=\".csv\")\n        try:\n            # Write master\
+      \ medicines to temp CSV (batch mode ignores the startup CSV)\n            with\
+      \ open(temp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:\n       \
+      \         fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']\n  \
+      \              writer = csv.DictWriter(csvfile, fieldnames=fieldnames)\n   \
+      \             writer.writeheader()\n                for m in master_medicines:\n\
+      \                    name_str = m.get(\"name\", \"\").strip()\n            \
+      \        writer.writerow({\n                        'code':     m.get(\"master_id\"\
+      , \"\"),\n                        'name':     name_str,\n                  \
+      \      'Compname': m.get(\"company\", \"\").strip(),\n                     \
+      \   'Pack':     m.get(\"pack\", \"\").strip(),\n                        'strength':\
+      \ extract_strength(name_str)\n                    })\n\n            temp_searcher\
+      \ = FuzzySearcher(temp_path)\n            temp_searcher.load()\n           \
+      \ temp_matcher  = FastMatcher(temp_searcher, model_key=\"gemma4_2b\")\n    \
+      \        temp_matcher.load_catalog()\n\n            # \u2500\u2500 Calculate\
+      \ optimal workers & initialize Engine Pool \u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\n            pool_size = calculate_optimal_workers(\"\
+      gemma4_2b\")\n            print(f\"[Batch Match] Dynamically using {pool_size}\
+      \ workers based on GPU VRAM availability.\")\n            \n            engine_pool\
+      \ = EnginePool(model_key=\"gemma4_2b\", size=pool_size)\n            engine_pool.populate()\n\
+      \n            mappings  = []   # matched items\n            unmatched = [] \
+      \  # products with no master match\n            total    = len(products)\n \
+      \           t_start  = time.time()\n\n            # \u2500\u2500 Shared state\
+      \ for the daemon reporter thread \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n       \
+      \     _state       = {\"processed\": 0, \"matched\": 0}\n            _done_event\
+      \  = threading.Event()\n            counter_lock = threading.Lock()\n\n    \
+      \        def _http_push(processed, matched):\n                \"\"\"Fire a single\
+      \ HTTP POST to the backend progress endpoint.\"\"\"\n                if not\
+      \ progress_url:\n                    return\n                import urllib.request\
+      \ as _req, json as _json\n                elapsed = time.time() - t_start\n\
+      \                rate    = processed / elapsed if elapsed > 0 else 0\n     \
+      \           eta_s   = (total - processed) / rate if rate > 0 else 0\n      \
+      \          body = _json.dumps({\n                    \"job_id\":      job_id,\n\
+      \                    \"secret\":      signal_secret,\n                    \"\
+      processed\":   processed,\n                    \"total\":       total,\n   \
+      \                 \"matched\":     matched,\n                    \"eta_seconds\"\
+      : round(eta_s, 1),\n                }).encode()\n                try:\n    \
+      \                req = _req.Request(\n                        progress_url,\
+      \ data=body,\n                        headers={\"Content-Type\": \"application/json\"\
+      },\n                        method=\"POST\",\n                    )\n      \
+      \              with _req.urlopen(req, timeout=5):\n                        pass\n\
+      \                except Exception as _e:\n                    print(f\"[Progress]\
+      \ HTTP push failed: {_e}\")\n\n            def _reporter_thread():\n       \
+      \         \"\"\"\n                Daemon thread: fires a progress callback every\
+      \ 30 s.\n                Never touches the match loop \u2014 reads shared counters\
+      \ only.\n                Wakes early when _done_event is set (job finished/failed).\n\
+      \                \"\"\"\n                INTERVAL = 30  # seconds between callbacks\n\
+      \                while not _done_event.wait(INTERVAL):\n                   \
+      \ _http_push(_state[\"processed\"], _state[\"matched\"])\n                #\
+      \ Final push on completion\n                _http_push(_state[\"processed\"\
+      ], _state[\"matched\"])\n\n            # Start reporter as a daemon so it dies\
+      \ if the process exits\n            reporter = threading.Thread(target=_reporter_thread,\
+      \ daemon=True)\n            reporter.start()\n\n            # Worker function\
+      \ for parallel execution\n            def process_product(prod):\n         \
+      \       prod_name = prod.get(\"name\", \"\").strip()\n                prod_pack\
+      \ = prod.get(\"pack\", \"\").strip()\n                prod_comp = prod.get(\"\
+      company\", \"\").strip()\n                prod_code = prod.get(\"code\", \"\"\
+      ).strip()\n\n                engine = engine_pool.lease()\n                try:\n\
+      \                    res_match = temp_matcher.match(\n                     \
+      \   f\"{prod_name} {prod_pack}\".strip(),\n                        name=prod_name,\
+      \ pack=prod_pack, compname=prod_comp,\n                        engine=engine\n\
+      \                    )\n                finally:\n                    engine_pool.release(engine)\n\
+      \n                if res_match:\n                    conf = compute_confidence(\n\
+      \                        prod_name,\n                        res_match['name'],\n\
+      \                        res_match.get('brand', ''),\n                     \
+      \   prod_pack,\n                        res_match.get('pack', '')\n        \
+      \            )\n                    mappings.append({\n                    \
+      \    \"vendor_code\":      prod_code,\n                        \"master_id\"\
+      :        res_match[\"code\"],\n                        \"product_name\":   \
+      \  prod_name,\n                        \"company\":          prod_comp,\n  \
+      \                      \"pack\":             prod_pack,\n                  \
+      \      \"matched_name\":     res_match[\"name\"],\n                        \"\
+      matched_pack\":     res_match.get(\"pack\", \"\"),\n                       \
+      \ \"matched_company\":  res_match.get(\"brand\", \"\"),\n                  \
+      \      \"source\":           \"gpu_ai\",\n                        \"confidence\"\
+      :       float(conf)\n                    })\n                else:\n       \
+      \             unmatched.append({\n                        \"vendor_code\": \
+      \ prod_code,\n                        \"product_name\": prod_name,\n       \
+      \                 \"company\":      prod_comp,\n                        \"pack\"\
+      :         prod_pack,\n                    })\n\n                with counter_lock:\n\
+      \                    _state[\"processed\"] += 1\n                    _state[\"\
+      matched\"]    = len(mappings)\n\n            # \u2500\u2500 Main matching loop\
+      \ (Parallel ThreadPoolExecutor) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\
+      \u2500\u2500\u2500\u2500\u2500\u2500\n            try:\n                with\
+      \ ThreadPoolExecutor(max_workers=pool_size) as executor:\n                 \
+      \   executor.map(process_product, products)\n            finally:\n        \
+      \        # Signal daemon to fire its final push and exit cleanly\n         \
+      \       _done_event.set()\n                reporter.join(timeout=10)\n     \
+      \           # Clean up engine pool and free VRAM\n                try:\n   \
+      \                 del engine_pool\n                    import gc\n         \
+      \           gc.collect()\n                except Exception:\n              \
+      \      pass\n\n            return jsonify({\"mappings\": mappings, \"unmatched\"\
+      : unmatched})\n\n        except Exception as e:\n            return jsonify({\"\
+      error\": f\"Batch match failed: {str(e)}\"}), 500\n        finally:\n      \
+      \      try:\n                os.remove(temp_path)\n            except Exception:\n\
+      \                pass\n\n    # Single match mode (legacy/original compatibility)\n\
+      \    name = data.get(\"name\", \"\").strip()\n    pack = data.get(\"pack\",\
+      \ \"\").strip()\n    compname = data.get(\"company\", \"\").strip() or data.get(\"\
+      compname\", \"\").strip()\n    query = data.get(\"query\", \"\").strip()\n\n\
+      \    if not query:\n        query = f\"{name} {pack}\".strip()\n\n    if not\
+      \ query:\n        return jsonify({\"error\": \"Field 'query' or 'name' is required.\"\
+      }), 400\n\n    t0 = time.time()\n    result = _matcher.match(query, name=name,\
+      \ pack=pack, compname=compname)\n    elapsed = time.time() - t0\n\n    return\
+      \ jsonify({\n        \"query\": query,\n        \"match\": result,\n       \
+      \ \"latency_ms\": round(elapsed * 1000, 2)\n    })\n\n@app.route(\"/search\"\
+      , methods=[\"POST\"])\ndef search_item():\n    data = request.get_json(silent=True)\
+      \ or {}\n    name = data.get(\"name\", \"\").strip()\n    if not name:\n   \
+      \     return jsonify({\"error\": \"Field 'name' is required.\"}), 400\n    pack\
+      \ = data.get(\"pack\", \"\").strip()\n    top_k = int(data.get(\"top_k\", 5))\n\
+      \    \n    results, elapsed_ms = _searcher.search(name, pack=pack, top_k=top_k)\n\
+      \    return jsonify({\n        \"query\": {\"name\": name, \"pack\": pack},\n\
+      \        \"results\": results,\n        \"count\": len(results),\n        \"\
+      search_ms\": elapsed_ms,\n    })\n\n@app.route(\"/health\", methods=[\"GET\"\
+      ])\ndef health():\n    return jsonify({\"status\": \"ok\", \"mode\": \"standalone_fast\"\
+      })\n\ndef main():\n    global _searcher, _matcher\n    import argparse\n   \
+      \ \n    parser = argparse.ArgumentParser(description=\"Standalone REST API Server\"\
+      )\n    parser.add_argument(\"--csv\", type=str, default=\"\", help=\"Path to\
+      \ catalog CSV\")\n    args = parser.parse_args()\n    \n    csv_path = args.csv\n\
+      \    if not csv_path:\n        # Check next to the script or inside parent\n\
+      \        user_home = os.path.expanduser(\"~\")\n        candidate_paths = [\n\
+      \            os.path.join(BASE_DIR, \"Item_export_2026-05-29_17-33-30.csv\"\
+      ),\n            os.path.join(os.path.dirname(BASE_DIR), \"Item_export_2026-05-29_17-33-30.csv\"\
+      ),\n            os.path.join(user_home, \"Downloads\", \"Item_export_2026-05-29_17-33-30.csv\"\
+      ),\n            os.path.join(user_home, \"Downloads\", \"item_export_2026-05-30_09-08-22.csv\"\
+      ),\n            os.path.join(os.path.dirname(sys.executable), \"Item_export_2026-05-29_17-33-30.csv\"\
+      ),\n            os.path.join(os.getcwd(), \"Item_export_2026-05-29_17-33-30.csv\"\
+      ),\n        ]\n        for p in candidate_paths:\n            if os.path.exists(p):\n\
+      \                csv_path = p\n                break\n                \n   \
+      \ if not csv_path or not os.path.exists(csv_path):\n        print(f\"Error:\
+      \ Unified CSV database not found.\")\n        sys.exit(1)\n        \n    print(f\"\
+      Loading search database from: {csv_path}...\")\n    _searcher = FuzzySearcher(csv_path=csv_path)\n\
+      \    _searcher.load()\n    \n    _matcher = FastMatcher(_searcher)\n    _matcher.load_catalog()\n\
+      \    \n    # Check if AI model is available\n    from qwen3_engine.config import\
+      \ MODEL_REGISTRY, DEFAULT_MODEL\n    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),\
+      \ \"..\", \"models\")\n    model_file = os.path.join(model_dir, MODEL_REGISTRY[DEFAULT_MODEL][\"\
+      filename\"])\n    if os.path.exists(model_file):\n        print(\"\u2713 AI\
+      \ model found \u2014 LLM fallback enabled (lazy load on first miss).\")\n  \
+      \  else:\n        print(\"\u26A0 AI model not found \u2014 running heuristic-only\
+      \ mode.\")\n\n    print(\"\u2713 Standalone fast server listening on port 8080...\"\
+      )\n    app.run(host=\"0.0.0.0\", port=8080, debug=False, threaded=True)\n\n\
+      if __name__ == \"__main__\":\n    main()\n"
+  - key: gpu_job_id
+    value: 8f7392c7-718f-4a76-96af-8a0c9a75c44e
+  - key: gpu_signal_secret
+    value: EmboloGPUSignal2026!
+  - key: ssh-keys
+    value: admin:ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDMc/b5zvvEdrOVA7Xo3SN6YHL5ol3esFNoWQ/cH4g2uins1oti8A2m2UAzcW7rUvKdZ0oY4+GYkRcnWyGf+kG/hRbGyz6pCOSifUmXozI/CgpPLXCuNMGHYIVO6ujJo3EK/GjsLwWNYItYFedi6XUCWmQ2Xubq8tDtfsa45yAqIghCFhNMOrVp+ieYgrgwrPEK3RTyxjAeqO4VGUqEgvdr34+j08tacEot/+6mbuJ9EEysHyyNbJp1hel1BJ/qTxyalNGzJzsGkZx9xve6BlAvqcdJGwBSQ/pqaao7dNwd0sBDpV4Xf9DdRqxdZtbhLt40H31i+XWZJr3cz1TlBzTl3gdkoF2hwE+z1YFb8JmEK4N5egOM7v1vC+hW0AHJi89O+wdbvyKujwo0i0FRhhARNBRPJKhTZUuMJNkQUAP8B0C/vKxwGSb1BW/WpXWWaW2Bb5KFlessvf4jilu+DpAbLW8Y5wyKxjuskcJdllp0zuFtnX5wmn/tJCN7vRnb828=
+      admin@Admins-MacBook-Air.local
+  - key: startup-script
+    value: "#!/bin/bash\n# =============================================================================\n\
+      # gpu_startup.sh \u2014 GPU VM startup script with automated API updates\n#\
+      \ =============================================================================\n\
+      \nset -euo pipefail\n\nMETADATA_HEADER=\"Metadata-Flavor: Google\"\nMETADATA_BASE=\"\
+      http://metadata.google.internal/computeMetadata/v1/instance/attributes\"\n\n\
+      log() { echo \"[gpu_startup] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*\"; }\n\nlog\
+      \ \"Reading job metadata from GCE metadata server...\"\nJOB_ID=$(curl -sf -H\
+      \ \"$METADATA_HEADER\" \"$METADATA_BASE/gpu_job_id\" || echo \"\")\nBACKEND_URL=$(curl\
+      \ -sf -H \"$METADATA_HEADER\" \"$METADATA_BASE/backend_url\" || echo \"\")\n\
+      SIGNAL_SECRET=$(curl -sf -H \"$METADATA_HEADER\" \"$METADATA_BASE/gpu_signal_secret\"\
+      \ || echo \"\")\n\nif [[ -z \"$JOB_ID\" || -z \"$BACKEND_URL\" || -z \"$SIGNAL_SECRET\"\
+      \ ]]; then\n    log \"ERROR: Missing required metadata. Ensure job_id, backend_url,\
+      \ and secret are set.\"\n    exit 1\nfi\n\n# \u2500\u2500 Update fast_server.py\
+      \ from metadata \u2500\u2500\nlog \"Updating fast_server.py with bulk-matching\
+      \ capabilities...\"\ncurl -sf -H \"$METADATA_HEADER\" \"$METADATA_BASE/fast_server_code\"\
+      \ > /home/admin/ai/qwen3_engine/fast_server.py\nchown admin:admin /home/admin/ai/qwen3_engine/fast_server.py\n\
+      chmod 700 /home/admin/ai/qwen3_engine/fast_server.py\n\n# \u2500\u2500 Start\
+      \ the fast server \u2500\u2500\nlog \"Starting fast_server.py on port 8080...\"\
+      \nfuser -k 8080/tcp || true\nsudo -u admin bash -c \"export PYTHONPATH=/home/admin/ai;\
+      \ export PYTHONIOENCODING=utf-8; nohup /home/admin/ai/venv/bin/python3 /home/admin/ai/qwen3_engine/fast_server.py\
+      \ --csv /home/admin/ai/Item_export_2026-05-29_17-33-30.csv > /home/admin/ai/fast_server_run.log\
+      \ 2>&1 &\"\n\n# \u2500\u2500 Wait for port 8080 \u2500\u2500\nELAPSED=0\nREADY=0\n\
+      while [ $ELAPSED -lt 300 ]; do\n    HTTP_CODE=$(curl -sf -o /dev/null -w \"\
+      %{http_code}\" --max-time 3 \"http://localhost:8080/health\" || echo \"000\"\
+      )\n    if [[ \"$HTTP_CODE\" == \"200\" || \"$HTTP_CODE\" == \"204\" ]]; then\n\
+      \        log \"Matcher service is healthy after ${ELAPSED}s (HTTP $HTTP_CODE).\"\
+      \n        READY=1\n        break\n    fi\n    log \"  [${ELAPSED}s] Waiting\
+      \ for server... (HTTP $HTTP_CODE)\"\n    sleep 3\n    ELAPSED=$((ELAPSED + 3))\n\
+      done\n\nMY_IP=$(curl -sf -H \"$METADATA_HEADER\" \"http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip\"\
+      \ || echo \"\")\n\nif [ $READY -eq 0 ]; then\n    log \"ERROR: Matcher did not\
+      \ start on port 8080 within 5 minutes.\"\n    curl -s -X POST \"${BACKEND_URL}/medicine-matching/admin/gpu-match/signal-ready\"\
+      \ \\\n        -H \"Content-Type: application/json\" \\\n        -d \"{\\\"job_id\\\
+      \": \\\"$JOB_ID\\\", \\\"secret\\\": \\\"$SIGNAL_SECRET\\\", \\\"ip\\\": \\\"\
+      ${MY_IP}\\\", \\\"error\\\": \\\"Matcher failed to start\\\"}\" || true\n  \
+      \  exit 1\nfi\n\nlog \"Signalling backend at $BACKEND_URL...\"\ncurl -s -w \"\
+      \\n%{http_code}\" -X POST \"${BACKEND_URL}/medicine-matching/admin/gpu-match/signal-ready\"\
+      \ \\\n    -H \"Content-Type: application/json\" \\\n    -d \"{\\\"job_id\\\"\
+      : \\\"$JOB_ID\\\", \\\"secret\\\": \\\"$SIGNAL_SECRET\\\", \\\"ip\\\": \\\"\
+      ${MY_IP}\\\"}\"\nlog \"Done!\"\n"
+  kind: compute#metadata
+name: instance-20260612-075658
+networkInterfaces:
+- accessConfigs:
+  - kind: compute#accessConfig
+    name: External NAT
+    networkTier: PREMIUM
+    type: ONE_TO_ONE_NAT
+  fingerprint: kM_eljKoRf8=
+  kind: compute#networkInterface
+  name: nic0
+  network: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/global/networks/default
+  networkIP: 10.128.0.2
+  stackType: IPV4_ONLY
+  subnetwork: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/regions/us-central1/subnetworks/default
+reservationAffinity:
+  consumeReservationType: ANY_RESERVATION
+scheduling:
+  automaticRestart: true
+  onHostMaintenance: TERMINATE
+  preemptible: false
+  provisioningModel: STANDARD
+selfLink: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/zones/us-central1-a/instances/instance-20260612-075658
+serviceAccounts:
+- email: 678069339023-compute@developer.gserviceaccount.com
+  scopes:
+  - https://www.googleapis.com/auth/devstorage.read_only
+  - https://www.googleapis.com/auth/logging.write
+  - https://www.googleapis.com/auth/monitoring.write
+  - https://www.googleapis.com/auth/service.management.readonly
+  - https://www.googleapis.com/auth/servicecontrol
+  - https://www.googleapis.com/auth/trace.append
+shieldedInstanceConfig:
+  enableIntegrityMonitoring: true
+  enableSecureBoot: false
+  enableVtpm: true
+shieldedInstanceIntegrityPolicy:
+  updateAutoLearnPolicy: true
+startRestricted: false
+status: TERMINATED
+tags:
+  fingerprint: 42WmSpB8rSM=
+zone: https://www.googleapis.com/compute/v1/projects/project-60a101a9-5ded-4b84-80e/zones/us-central1-a

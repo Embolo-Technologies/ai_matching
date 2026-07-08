@@ -93,6 +93,21 @@ MODEL_REGISTRY = {
         ),
         "description": "Tiny · 2B · Gemma 4 Effective · GPU offloaded · Gemma template",
     },
+    "gemma4_4b": {
+        "name":              "Gemma 4 E4B Instruct",
+        "filename":          "gemma-4-E4B-it-Q4_K_M.gguf",
+        "hf_repo":           "unsloth/gemma-4-E4B-it-GGUF",
+        "hf_file":           "gemma-4-E4B-it-Q4_K_M.gguf",
+        "size_mb":           5400,
+        "template":          "gemma",
+        "supports_thinking": False,
+        "n_gpu_layers":      32,
+        "system_prompt": (
+            "You are a strict, deterministic medical data-matching engine. "
+            "Your ONLY job is to select the single correct candidate from a list."
+        ),
+        "description": "Medium · 4B · Gemma 4 Effective · GPU offloaded · Gemma template",
+    },
 }
 
 DEFAULT_MODEL = "gemma4_2b"

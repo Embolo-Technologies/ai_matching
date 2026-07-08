@@ -55,7 +55,8 @@ def calculate_optimal_workers(model_key: str) -> int:
         return 1
         
     optimal_workers = available_mem // vram_per_worker
-    return max(1, min(40, int(optimal_workers)))
+    # Cap maximum parallel GPU workers at 8 to avoid CUDA driver/context exhaustion
+    return min(8, max(1, int(optimal_workers)))
 
 
 class EnginePool:
