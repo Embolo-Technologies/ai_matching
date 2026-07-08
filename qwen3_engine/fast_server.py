@@ -66,9 +66,20 @@ class EnginePool:
         self.num_gpus = max(1, get_num_gpus())
 
     def populate(self):
+        from qwen3_engine.vllm_engine import VLLMEngine
+        probe = VLLMEngine()
+        if probe.check_ready(timeout=2.0):
+            print(f"[EnginePool] llama_cpp.server detected on port 8000 — Using VLLMEngine for continuous batching.")
+            for i in range(self.size):
+                engine = VLLMEngine()
+                engine._ready = True
+                self.pool.put(engine)
+            print(f"[EnginePool] ✓ {self.size} workers wired to llama_cpp.server.")
+            return
+
         from qwen3_engine.engine import Qwen3Engine
         from qwen3_engine.config import N_CTX_MATCHER
-        print(f"[EnginePool] Loading {self.size} workers across {self.num_gpus} GPU(s) (n_ctx={N_CTX_MATCHER})...")
+        print(f"[EnginePool] llama_cpp.server not detected. Loading local {self.size} models across {self.num_gpus} GPU(s)...")
         for i in range(self.size):
             gpu_id = i % self.num_gpus
             t0 = time.time()
@@ -529,17 +540,25 @@ class FastMatcher:
             global _llm_engines
             engine = _llm_engines.get(self.model_key)
             if engine is None:
-                try:
-                    from qwen3_engine.engine import Qwen3Engine
-                    from qwen3_engine.config import N_CTX_MATCHER
-                    engine = Qwen3Engine(model_key=self.model_key)
-                    print(f"[AI] Loading local {self.model_key} LLM for fallback matching...")
-                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
-                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                from qwen3_engine.vllm_engine import VLLMEngine
+                probe = VLLMEngine()
+                if probe.check_ready(timeout=2.0):
+                    print(f"[AI] Using VLLMEngine (llama_cpp.server on port 8000) for fallback matching...")
+                    engine = VLLMEngine()
+                    engine._ready = True
                     _llm_engines[self.model_key] = engine
-                except Exception as e:
-                    print(f"[AI] ⚠ Could not load LLM {self.model_key}: {e}")
-                    return None
+                else:
+                    try:
+                        from qwen3_engine.engine import Qwen3Engine
+                        from qwen3_engine.config import N_CTX_MATCHER
+                        engine = Qwen3Engine(model_key=self.model_key)
+                        print(f"[AI] Loading local {self.model_key} LLM for fallback matching...")
+                        engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                        print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                        _llm_engines[self.model_key] = engine
+                    except Exception as e:
+                        print(f"[AI] ⚠ Could not load LLM {self.model_key}: {e}")
+                        return None
 
         if not engine or not engine.is_loaded():
             return None
@@ -658,17 +677,25 @@ class FastMatcher:
             global _llm_engines
             engine = _llm_engines.get(self.model_key)
             if engine is None:
-                try:
-                    from qwen3_engine.engine import Qwen3Engine
-                    from qwen3_engine.config import N_CTX_MATCHER
-                    engine = Qwen3Engine(model_key=self.model_key)
-                    print(f"[AI] Loading local {self.model_key} LLM for verification...")
-                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
-                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                from qwen3_engine.vllm_engine import VLLMEngine
+                probe = VLLMEngine()
+                if probe.check_ready(timeout=2.0):
+                    print(f"[AI] Using VLLMEngine (llama_cpp.server on port 8000) for verification...")
+                    engine = VLLMEngine()
+                    engine._ready = True
                     _llm_engines[self.model_key] = engine
-                except Exception as e:
-                    print(f"[AI] ✗ Failed to load LLM: {e}")
-                    return False
+                else:
+                    try:
+                        from qwen3_engine.engine import Qwen3Engine
+                        from qwen3_engine.config import N_CTX_MATCHER
+                        engine = Qwen3Engine(model_key=self.model_key)
+                        print(f"[AI] Loading local {self.model_key} LLM for verification...")
+                        engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                        print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
+                        _llm_engines[self.model_key] = engine
+                    except Exception as e:
+                        print(f"[AI] ✗ Failed to load LLM: {e}")
+                        return False
 
         if not engine or not engine.is_loaded():
             return False
@@ -969,6 +996,107 @@ def health():
     if _searcher is None or _matcher is None or _engine_pool is None:
         return jsonify({"status": "initialising"}), 503
     return jsonify({"status": "ok", "mode": "standalone_fast", "workers": _engine_pool.size})
+
+def get_gce_metadata(attribute_name: str) -> str:
+    url = f"http://metadata.google.internal/computeMetadata/v1/instance/attributes/{attribute_name}"
+    import urllib.request as _req
+    req = _req.Request(url)
+    req.add_header("Metadata-Flavor", "Google")
+    try:
+        with _req.urlopen(req, timeout=2) as resp:
+            return resp.read().decode('utf-8').strip()
+    except Exception:
+        return ""
+
+def initialize_on_import():
+    global _searcher, _matcher
+    # Fetch parameters from environment or GCE metadata
+    backend_url = os.environ.get("BACKEND_URL") or get_gce_metadata("backend_url")
+    secret = os.environ.get("GPU_SIGNAL_SECRET") or get_gce_metadata("gpu_signal_secret")
+
+    if backend_url and secret:
+        import urllib.request as _req, json as _json, tempfile, csv
+        catalog_url = f"{backend_url.rstrip('/')}/medicine-matching/admin/gpu-match/catalog?secret={secret}"
+        print(f"[Startup] Fetching master medicines from backend: {catalog_url}...")
+        try:
+            with _req.urlopen(catalog_url, timeout=120) as resp:
+                raw = _json.loads(resp.read())
+            medicines = raw.get("catalog", [])
+            print(f"[Startup] Received {len(medicines):,} master medicines from backend.")
+        except Exception as e:
+            print(f"[Startup] ERROR: Failed to fetch catalog from backend: {e}")
+            sys.exit(1)
+
+        # Write to a temp CSV so FuzzySearcher can load it
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+        try:
+            with open(tmp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for m in medicines:
+                    name_str = (m.get("name") or "").strip()
+                    writer.writerow({
+                        'code':     m.get("master_id") or m.get("code") or "",
+                        'name':     name_str,
+                        'Compname': (m.get("company") or "").strip(),
+                        'Pack':     (m.get("pack") or "").strip(),
+                        'strength': extract_strength(name_str),
+                    })
+            print(f"[Startup] Building FuzzySearcher index from {len(medicines):,} medicines...")
+            _searcher = FuzzySearcher(csv_path=tmp_path)
+            _searcher.load()
+        finally:
+            import os as _os
+            try: _os.unlink(tmp_path)
+            except Exception: pass
+    else:
+        # Fallback to local CSV
+        user_home = os.path.expanduser("~")
+        candidate_paths = [
+            os.path.join(BASE_DIR, "Item_export_2026-05-29_17-33-30.csv"),
+            os.path.join(os.path.dirname(BASE_DIR), "Item_export_2026-05-29_17-33-30.csv"),
+            os.path.join(user_home, "Downloads", "Item_export_2026-05-29_17-33-30.csv"),
+            os.path.join(user_home, "Downloads", "item_export_2026-05-30_09-08-22.csv"),
+            os.path.join(os.path.dirname(sys.executable), "Item_export_2026-05-29_17-33-30.csv"),
+            os.path.join(os.getcwd(), "Item_export_2026-05-29_17-33-30.csv"),
+        ]
+        csv_path = None
+        for p in candidate_paths:
+            if os.path.exists(p):
+                csv_path = p
+                break
+        if not csv_path or not os.path.exists(csv_path):
+            print(f"Error: Unified CSV database not found. Pass BACKEND_URL and GPU_SIGNAL_SECRET env variables.")
+            sys.exit(1)
+
+        print(f"Loading search database from: {csv_path}...")
+        _searcher = FuzzySearcher(csv_path=csv_path)
+        _searcher.load()
+
+    _matcher = FastMatcher(_searcher)
+    _matcher.load_catalog()
+
+    # Pre-load engine pool in background so health returns 503 until ready
+    def _preload_pool():
+        global _engine_pool
+        from qwen3_engine.config import N_CTX_MATCHER
+        pool_size = calculate_optimal_workers("gemma4_2b")
+        from qwen3_engine.vllm_engine import VLLMEngine
+        probe = VLLMEngine()
+        if probe.check_ready(timeout=2.0):
+            pool_size = 60
+        pool = EnginePool(model_key="gemma4_2b", size=pool_size)
+        pool.populate()
+        _engine_pool = pool
+
+    import threading as _threading
+    _threading.Thread(target=_preload_pool, daemon=True).start()
+
+# Initialize automatically on import if NOT running via CLI command-line tool with arguments
+import sys
+if not (len(sys.argv) > 1 and ("--backend-url" in sys.argv or "--csv" in sys.argv)):
+    initialize_on_import()
 
 def main():
     global _searcher, _matcher
