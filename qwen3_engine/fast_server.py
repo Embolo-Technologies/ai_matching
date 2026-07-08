@@ -4,6 +4,7 @@ import sys
 import time
 import re
 import json
+import subprocess
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
@@ -11,36 +12,74 @@ from flask_cors import CORS
 from rapidfuzz import process, fuzz
 from qwen3_engine.searcher import FuzzySearcher
 from qwen3_engine.pharma_data import formulations_compatible
-from qwen3_engine.vllm_engine import VLLMEngine
-from qwen3_engine.config import VLLM_MAX_WORKERS
 
-# ─── vLLM-backed Engine Pool ──────────────────────────────────────────────────
-# Inference now runs inside a separate vLLM server process (continuous batching
-# on the GPU — no per-worker model load, no GPU lock). This pool just holds
-# lightweight HTTP-client wrappers so worker threads reuse connections instead
-# of constructing a new VLLMEngine per request.
+# ─── GPU Concurrency & Engine Pool Helpers ──────────────────────────────────────────
+def get_gpu_info() -> tuple:
+    """
+    Returns (num_gpus, vram_mb_per_gpu) where vram_mb_per_gpu is a list.
+    Falls back to (0, []) if nvidia-smi is unavailable.
+    """
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5, check=True
+        )
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip().isdigit()]
+        vram_list = [int(x) for x in lines]
+        return len(vram_list), vram_list
+    except Exception:
+        return 0, []
+
+
+def calculate_optimal_workers(model_key: str) -> int:
+    """
+    Auto-detects number of GPUs and VRAM per GPU.
+    Returns total safe worker count across all GPUs.
+    Each worker needs ~1.82 GB (model weights + KV cache at n_ctx=1024).
+    Leaves ~4 GB buffer per GPU for safety.
+    """
+    num_gpus, vram_list = get_gpu_info()
+    if not vram_list:
+        return 16  # safe CPU-only fallback
+
+    total_workers = 0
+    for vram_mb in vram_list:
+        safe_workers = max(1, int((vram_mb - 4000) // 1900))
+        total_workers += safe_workers
+
+    print(f"[Workers] {num_gpus} GPU(s) detected: {vram_list} MB each → {total_workers} total workers")
+    return total_workers
+
+
+def get_num_gpus() -> int:
+    """Returns number of available GPUs (0 if none)."""
+    num_gpus, _ = get_gpu_info()
+    return num_gpus
+
+
 class EnginePool:
-    def __init__(self, size: int = VLLM_MAX_WORKERS):
+    """Thread-safe pool of independent model instances spread across all available GPUs."""
+    def __init__(self, model_key: str, size: int):
+        self.model_key = model_key
         self.size = size
         self.pool = queue.Queue()
+        self.num_gpus = max(1, get_num_gpus())
 
     def populate(self):
-        print(f"[EnginePool] Creating {self.size} vLLM HTTP client workers...")
-        probe = VLLMEngine()
-        if not probe.check_ready(timeout=10.0):
-            raise RuntimeError(
-                "vLLM server is not reachable at startup. "
-                "Ensure the vLLM server (port 8000) is running before the Flask matcher starts."
-            )
+        from qwen3_engine.engine import Qwen3Engine
+        from qwen3_engine.config import N_CTX_MATCHER
+        print(f"[EnginePool] Loading {self.size} workers across {self.num_gpus} GPU(s) (n_ctx={N_CTX_MATCHER})...")
         for i in range(self.size):
-            engine = VLLMEngine()
-            engine._ready = True
+            gpu_id = i % self.num_gpus
+            t0 = time.time()
+            engine = Qwen3Engine(model_key=self.model_key, gpu_id=gpu_id)
+            engine.load(n_ctx=N_CTX_MATCHER, num_gpus=self.num_gpus)
             self.pool.put(engine)
-        print(f"[EnginePool] ✓ {self.size} workers ready (vLLM server confirmed reachable).")
-
+            print(f"  ✓ Worker {i+1}/{self.size} on GPU {gpu_id} ready in {time.time()-t0:.1f}s")
+            
     def lease(self):
         return self.pool.get()
-
+        
     def release(self, engine):
         self.pool.put(engine)
 
@@ -152,7 +191,7 @@ app = Flask(__name__)
 CORS(app)
 
 _searcher = None
-_llm_engines = {}   # Lazy-loaded AI engines for fallback: model_key -> VLLMEngine
+_llm_engines = {}   # Lazy-loaded AI engines for fallback: model_key -> Qwen3Engine
 
 def is_abbreviation(abbrev: str, full: str) -> bool:
     abbrev = abbrev.lower().strip()
@@ -485,18 +524,21 @@ class FastMatcher:
         return None, 0
 
     def llm_rerank(self, query: str, candidates: list, name: str = "", compname: str = "", engine=None) -> dict:
-        """AI fallback: ask the vLLM-served model to pick the correct match."""
+        """AI fallback: ask the local LLM to pick the correct match."""
         if engine is None:
             global _llm_engines
             engine = _llm_engines.get(self.model_key)
             if engine is None:
                 try:
-                    engine = VLLMEngine()
-                    if not engine.check_ready(timeout=5.0):
-                        raise RuntimeError("vLLM server not reachable")
+                    from qwen3_engine.engine import Qwen3Engine
+                    from qwen3_engine.config import N_CTX_MATCHER
+                    engine = Qwen3Engine(model_key=self.model_key)
+                    print(f"[AI] Loading local {self.model_key} LLM for fallback matching...")
+                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
                     _llm_engines[self.model_key] = engine
                 except Exception as e:
-                    print(f"[AI] ⚠ vLLM server not reachable: {e}")
+                    print(f"[AI] ⚠ Could not load LLM {self.model_key}: {e}")
                     return None
 
         if not engine or not engine.is_loaded():
@@ -617,12 +659,15 @@ class FastMatcher:
             engine = _llm_engines.get(self.model_key)
             if engine is None:
                 try:
-                    engine = VLLMEngine()
-                    if not engine.check_ready(timeout=5.0):
-                        raise RuntimeError("vLLM server not reachable")
+                    from qwen3_engine.engine import Qwen3Engine
+                    from qwen3_engine.config import N_CTX_MATCHER
+                    engine = Qwen3Engine(model_key=self.model_key)
+                    print(f"[AI] Loading local {self.model_key} LLM for verification...")
+                    engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
+                    print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
                     _llm_engines[self.model_key] = engine
                 except Exception as e:
-                    print(f"[AI] ✗ vLLM server not reachable: {e}")
+                    print(f"[AI] ✗ Failed to load LLM: {e}")
                     return False
 
         if not engine or not engine.is_loaded():
@@ -1002,32 +1047,42 @@ def main():
     _matcher = FastMatcher(_searcher)
     _matcher.load_catalog()
 
-    # ── Wait for the vLLM server (separate process, started by the GCE
-    # startup script) to come up, then populate a lightweight worker pool.
-    # Health returns 503 until this completes. ──
+    # Check if AI model is available
+    from qwen3_engine.config import MODEL_REGISTRY, DEFAULT_MODEL
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
+    model_file = os.path.join(model_dir, MODEL_REGISTRY[DEFAULT_MODEL]["filename"])
+    if os.path.exists(model_file):
+        print("✓ AI model found — LLM fallback enabled.")
+    else:
+        print("⚠ AI model not found — running heuristic-only mode.")
+
+    # ── Pre-load engine pool in background so health returns 503 until ready ──
     def _preload_pool():
         global _engine_pool
-        print(f"[Startup] Waiting for vLLM server at {VLLM_MAX_WORKERS} workers config, polling readiness...")
-        probe = VLLMEngine()
-        deadline = time.time() + 600  # up to 10 min for vLLM to load the model
-        while time.time() < deadline:
-            if probe.check_ready(timeout=5.0):
-                break
-            print("[Startup] vLLM server not ready yet, retrying in 5s...")
-            time.sleep(5)
-        else:
-            print("[Startup] ERROR: vLLM server did not become reachable within 10 minutes.")
-            return
+        from qwen3_engine.config import N_CTX_MATCHER, MODEL_REGISTRY, DEFAULT_MODEL
+        pool_size = calculate_optimal_workers("gemma4_2b")
+        print(f"[Startup] Pre-loading engine pool: {pool_size} workers (n_ctx={N_CTX_MATCHER})...")
 
-        pool = EnginePool(size=VLLM_MAX_WORKERS)
+        # ── Pre-warm: read model file into OS RAM cache once ──
+        # This makes all workers load from RAM (1.6s each) instead of cold disk (137s for first worker)
+        if os.path.exists(model_file):
+            model_size_mb = os.path.getsize(model_file) / (1024 * 1024)
+            print(f"[Startup] Pre-warming disk cache: reading {model_size_mb:.0f}MB model into RAM...")
+            t_warm = time.time()
+            with open(model_file, 'rb') as f:
+                while f.read(64 * 1024 * 1024):  # Read in 64MB chunks
+                    pass
+            print(f"[Startup] Disk cache warm in {time.time()-t_warm:.1f}s — all workers will load from RAM.")
+
+        pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
-        print(f"[Startup] Engine pool ready — {VLLM_MAX_WORKERS} workers wired to vLLM. Health now returns 200.")
+        print(f"[Startup] Engine pool ready — {pool_size} workers loaded. Health now returns 200.")
 
     import threading as _threading
     _threading.Thread(target=_preload_pool, daemon=True).start()
 
-    print("✓ Standalone fast server listening on port 8080 (waiting on vLLM in background)...")
+    print("✓ Standalone fast server listening on port 8080 (pool loading in background)...")
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
 
 if __name__ == "__main__":

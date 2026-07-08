@@ -82,7 +82,7 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="
   source venv/bin/activate &&
   pip install pandas openpyxl rapidfuzz flask flask-cors &&
   echo '✓ Compiling llama-cpp with CUDA support...' &&
-  CMAKE_ARGS='-GGML_CUDA=on' pip install --force-reinstall --no-cache-dir llama-cpp-python &&
+  CMAKE_ARGS='-DGGML_CUDA=on' pip install --force-reinstall --no-cache-dir llama-cpp-python &&
   echo '✓ Running matching run...' &&
   python run_batch_match.py --master-xlsx masterdata.xlsx --input-xlsx input.xlsx --output-xlsx full_matching_results.xlsx
 "

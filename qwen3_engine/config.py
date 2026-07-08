@@ -174,9 +174,11 @@ SERVER_HOST  = "0.0.0.0"
 SERVER_PORT  = 8080
 SERVER_DEBUG = False
 
-# ─── vLLM Server (GPU batch-matching pipeline only) ───────────────────────────
-# The interactive chat/CLI tools (chat.py, server.py, matcher.py) still use
-# Qwen3Engine + llama-cpp-python directly and are unaffected by these settings.
-VLLM_BASE_URL    = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
-VLLM_MODEL_NAME  = os.environ.get("VLLM_MODEL_NAME", "google/gemma-2-2b-it")
-VLLM_MAX_WORKERS = int(os.environ.get("VLLM_MAX_WORKERS", "40"))
+# ─── llama_cpp.server (GPU batch-matching pipeline) ─────────────────────────
+# Built-in OpenAI-compatible server with native C++ batching.
+# Loads local GGUF models and exposes /v1/chat/completions on port 8000.
+LLAMA_SERVER_BASE_URL  = os.environ.get("LLAMA_SERVER_BASE_URL", "http://localhost:8000/v1")
+LLAMA_SERVER_MODEL     = os.environ.get("LLAMA_SERVER_MODEL", os.path.join(MODELS_DIR, MODEL_REGISTRY["gemma4_2b"]["filename"]))
+LLAMA_SERVER_N_CTX     = int(os.environ.get("LLAMA_SERVER_N_CTX", "1024"))
+LLAMA_SERVER_N_GPU_LAYERS = int(os.environ.get("LLAMA_SERVER_N_GPU_LAYERS", "-1"))
+LLAMA_SERVER_MAX_WORKERS = int(os.environ.get("LLAMA_SERVER_MAX_WORKERS", "40"))
