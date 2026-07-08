@@ -823,9 +823,9 @@ def match_item():
         if _searcher is None or _matcher is None:
             return jsonify({"error": "Server still initialising — searchers not ready."}), 503
 
-        # Wait up to 60 seconds for engine pool to finish populating in the background
+        # Wait up to 180 seconds for engine pool to finish populating in the background
         wait_elapsed = 0
-        while _engine_pool is None and wait_elapsed < 60:
+        while _engine_pool is None and wait_elapsed < 180:
             time.sleep(0.5)
             wait_elapsed += 0.5
 
@@ -1096,7 +1096,7 @@ def initialize_on_import():
         from qwen3_engine.vllm_engine import VLLMEngine
         probe = VLLMEngine()
         if probe.check_ready(timeout=2.0):
-            pool_size = 80
+            pool_size = 60
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
