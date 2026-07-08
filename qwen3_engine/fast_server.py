@@ -1005,6 +1005,9 @@ def health():
     if _searcher is None or _matcher is None:
         return jsonify({"status": "initialising"}), 503
     pool_size = _engine_pool.size if _engine_pool else 0
+    if pool_size == 0:
+        # Pool still loading — tell startup script to keep waiting
+        return jsonify({"status": "initialising", "mode": "standalone_fast", "workers": 0}), 503
     return jsonify({"status": "ok", "mode": "standalone_fast", "workers": pool_size})
 
 
