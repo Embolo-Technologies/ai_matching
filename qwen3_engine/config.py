@@ -173,3 +173,10 @@ VERBOSE_LLAMA          = False
 SERVER_HOST  = "0.0.0.0"
 SERVER_PORT  = 8080
 SERVER_DEBUG = False
+
+# ─── vLLM Server (GPU batch-matching pipeline only) ───────────────────────────
+# The interactive chat/CLI tools (chat.py, server.py, matcher.py) still use
+# Qwen3Engine + llama-cpp-python directly and are unaffected by these settings.
+VLLM_BASE_URL    = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
+VLLM_MODEL_NAME  = os.environ.get("VLLM_MODEL_NAME", "google/gemma-2-2b-it")
+VLLM_MAX_WORKERS = int(os.environ.get("VLLM_MAX_WORKERS", "40"))
