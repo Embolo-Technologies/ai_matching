@@ -84,7 +84,7 @@ MODEL_REGISTRY = {
         "filename":          "gemma-4-E2B-it-Q4_K_M.gguf",
         "hf_repo":           "unsloth/gemma-4-E2B-it-GGUF",
         "hf_file":           "gemma-4-E2B-it-Q4_K_M.gguf",
-        "size_mb":           1400,
+        "size_mb":           1700,
         "template":          "gemma",
         "supports_thinking": False,
         "n_gpu_layers":      32, # Safe VRAM boundary for Apple M-series Metal watchdog stability
@@ -92,6 +92,21 @@ MODEL_REGISTRY = {
             "You are a helpful, concise, and knowledgeable assistant."
         ),
         "description": "Tiny · 2B · Gemma 4 Effective · GPU offloaded · Gemma template",
+    },
+    "gemma4_4b": {
+        "name":              "Gemma 4 E4B Instruct",
+        "filename":          "gemma-4-E4B-it-Q4_K_M.gguf",
+        "hf_repo":           "unsloth/gemma-4-E4B-it-GGUF",
+        "hf_file":           "gemma-4-E4B-it-Q4_K_M.gguf",
+        "size_mb":           5400,
+        "template":          "gemma",
+        "supports_thinking": False,
+        "n_gpu_layers":      32,
+        "system_prompt": (
+            "You are a strict, deterministic medical data-matching engine. "
+            "Your ONLY job is to select the single correct candidate from a list."
+        ),
+        "description": "Medium · 4B · Gemma 4 Effective · GPU offloaded · Gemma template",
     },
 }
 
@@ -139,7 +154,7 @@ MODEL_PATH    = os.path.join(MODELS_DIR, MODEL_REGISTRY[DEFAULT_MODEL]["filename
 
 # ─── Inference Settings ───────────────────────────────────────────────────────
 N_CTX         = 2048
-N_CTX_MATCHER = 2048
+N_CTX_MATCHER = 1024
 N_GPU_LAYERS  = -1    # -1 = offload all layers to GPU
 N_THREADS     = min(8, max(6, multiprocessing.cpu_count() - 2))
 N_BATCH       = 1024
