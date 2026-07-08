@@ -1095,7 +1095,11 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        pool_size = 8  # 10 Gunicorn processes * 8 engines = 80 total engines
+        # Native llama-server (port 8000) runs with --parallel 32 — pool slots are
+        # lightweight HTTP clients (VLLMEngine), no local CUDA context per slot, so
+        # the old per-process cap (needed only to limit local-model CUDA contexts)
+        # no longer applies. Sized to match the server's parallel-slot capacity.
+        pool_size = 32
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
