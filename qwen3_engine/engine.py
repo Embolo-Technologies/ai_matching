@@ -25,7 +25,11 @@ class Qwen3Engine:
 
         self._cfg          = MODEL_REGISTRY[self.model_key]
         self._template     = TEMPLATES[self._cfg["template"]]
-        self._model_path   = os.path.join(MODELS_DIR, self._cfg["filename"])
+        shm_path = os.path.join("/dev/shm", self._cfg["filename"])
+        if os.path.exists(shm_path):
+            self._model_path = shm_path
+        else:
+            self._model_path = os.path.join(MODELS_DIR, self._cfg["filename"])
         self.system_prompt = system_prompt or self._cfg["system_prompt"]
         self.thinking_mode = (
             thinking_mode
@@ -47,10 +51,17 @@ class Qwen3Engine:
 
     def load(self, n_ctx: int = None) -> None:
         if not os.path.exists(self._model_path):
-            raise FileNotFoundError(
-                f"Model file not found: {self._model_path}\n"
-                f"Download it with:  bash run.sh download {self.model_key}"
-            )
+            print(f"[Engine] Model file not found at {self._model_path}. Downloading automatically...")
+            try:
+                from qwen3_engine.downloader import download_model
+                success = download_model(self.model_key)
+                if not success or not os.path.exists(self._model_path):
+                    raise FileNotFoundError(f"Auto-download failed for model '{self.model_key}'")
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Model file not found: {self._model_path} and auto-download failed: {e}\n"
+                    f"Download it with:  bash run.sh download {self.model_key}"
+                )
         try:
             from llama_cpp import Llama
         except ImportError:
@@ -68,6 +79,7 @@ class Qwen3Engine:
             n_batch=N_BATCH,
             verbose=VERBOSE_LLAMA,
             flash_attn=True,
+            use_mmap=True,
         )
         self._load_time = time.time() - t0
 
