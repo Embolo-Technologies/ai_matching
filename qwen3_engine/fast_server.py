@@ -34,7 +34,7 @@ def get_free_gpu_memory() -> int:
 
 def calculate_optimal_workers(model_key: str) -> int:
     """Returns fixed 40 workers — tuned for A100 40GB GPU with n_ctx=1024 and mmap=True."""
-    return 40
+    return 20
 
 
 class EnginePool:
