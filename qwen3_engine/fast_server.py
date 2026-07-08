@@ -47,13 +47,33 @@ class EnginePool:
     def populate(self):
         from qwen3_engine.engine import Qwen3Engine
         from qwen3_engine.config import N_CTX_MATCHER
-        print(f"[EnginePool] Initializing {self.size} workers (n_ctx={N_CTX_MATCHER})...")
-        for i in range(self.size):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        print(f"[EnginePool] Loading {self.size} workers in parallel batches of 4 (n_ctx={N_CTX_MATCHER})...")
+        _print_lock = threading.Lock()
+
+        def load_one(i):
             t0 = time.time()
             engine = Qwen3Engine(model_key=self.model_key)
             engine.load(n_ctx=N_CTX_MATCHER)
+            with _print_lock:
+                print(f"  ✓ Worker {i+1}/{self.size} ready in {time.time()-t0:.1f}s")
+            return engine
+
+        # Load in batches of 4 — each batch commits VRAM before next starts
+        # Avoids CUDA out-of-memory from simultaneous allocation race
+        BATCH = 4
+        all_engines = []
+        for start in range(0, self.size, BATCH):
+            batch_ids = range(start, min(start + BATCH, self.size))
+            with ThreadPoolExecutor(max_workers=len(batch_ids)) as ex:
+                batch_engines = list(ex.map(load_one, batch_ids))
+            all_engines.extend(batch_engines)
+
+        for engine in all_engines:
             self.pool.put(engine)
-            print(f"  ✓ Worker {i+1}/{self.size} loaded in {time.time()-t0:.1f}s")
+        print(f"[EnginePool] All {self.size} workers ready.")
             
     def lease(self):
         return self.pool.get()
