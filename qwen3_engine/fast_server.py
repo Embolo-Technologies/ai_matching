@@ -670,83 +670,6 @@ class FastMatcher:
             print(f"[AI] Parse error: {e}")
         return None
 
-    def ai_verify(self, query: str, candidate: dict, name: str = "", compname: str = "", engine=None) -> bool:
-        """AI verification: ask the LLM if a heuristic match is correct (yes/no).
-        Used for medium-confidence matches (80-94% brand similarity)."""
-        if engine is None:
-            global _llm_engines
-            engine = _llm_engines.get(self.model_key)
-            if engine is None:
-                from qwen3_engine.vllm_engine import VLLMEngine
-                probe = VLLMEngine()
-                if probe.check_ready(timeout=2.0):
-                    print(f"[AI] Using VLLMEngine (llama_cpp.server on port 8000) for verification...")
-                    engine = VLLMEngine()
-                    engine._ready = True
-                    _llm_engines[self.model_key] = engine
-                else:
-                    try:
-                        from qwen3_engine.engine import Qwen3Engine
-                        from qwen3_engine.config import N_CTX_MATCHER
-                        engine = Qwen3Engine(model_key=self.model_key)
-                        print(f"[AI] Loading local {self.model_key} LLM for verification...")
-                        engine.load(n_ctx=N_CTX_MATCHER if 'N_CTX_MATCHER' in dir() else 2048)
-                        print(f"[AI] ✓ LLM {self.model_key} loaded successfully.")
-                        _llm_engines[self.model_key] = engine
-                    except Exception as e:
-                        print(f"[AI] ✗ Failed to load LLM: {e}")
-                        return False
-
-        if not engine or not engine.is_loaded():
-            return False
-
-        # Set system prompt unconditionally
-        engine.system_prompt = "You verify if two medicine descriptions refer to the same medicine. Answer ONLY with YES or NO."
-
-        cand_str = f"{candidate['name']}"
-        if candidate.get('strength'):
-            cand_str += f" {candidate['strength']}"
-        if candidate.get('pack'):
-            cand_str += f" ({candidate['pack']})"
-        if candidate.get('brand'):
-            cand_str += f" [Company: {candidate['brand']}]"
-
-        q_display = name if name else query
-        if compname and compname.strip() and compname.strip() != '--':
-            q_display += f" [Company: {compname}]"
-
-        prompt = (
-            "You are a medical data verification assistant. Decide if the Chemist name and the Wholesaler name refer to the exact same medicine (same brand/drug, same strength, compatible formulation, same company).\n"
-            "Trailing unit symbols like 'MG' can be omitted in one of them. Oral forms like tablets (TAB) and capsules (CAP) match each other.\n"
-            "If the companies are clearly specified and different, the answer must be NO.\n\n"
-            "Examples:\n"
-            "Chemist: CLOFRANIL 50MG TAB 10TAB [Company: INTAS]\n"
-            "Wholesaler: CLOFRANIL 50 (S10) [Company: INTAS]\n"
-            "Answer: YES\n\n"
-            "Chemist: PAN 40 TAB [Company: ALKEM]\n"
-            "Wholesaler: PAN D (10 CAP) [Company: ALKEM]\n"
-            "Answer: NO\n\n"
-            "Chemist: CALPOL 650 [Company: GSK]\n"
-            "Wholesaler: CALPOL 500 (15 TAB) [Company: GSK]\n"
-            "Answer: NO\n\n"
-            "Chemist: BRIV SYRUP 100ML [Company: DR REDDY]\n"
-            "Wholesaler: BRIVATAB 100ML ORAL SOLUTION (100ML) [Company: HETERO]\n"
-            "Answer: NO\n\n"
-            f"Chemist: {q_display}\n"
-            f"Wholesaler: {cand_str}\n"
-            "Answer:"
-        )
-
-        engine.clear_history()
-        response = engine.generate(prompt, max_tokens=20, temperature=0.0).strip().upper()
-        print(f"[AI Verify] '{q_display}' vs '{candidate['name']}' → {response}")
-
-        # Accept if AI says YES and guardrail also passes
-        if 'YES' in response:
-            return True
-        return False
-
-
     def match(self, query: str, name: str = "", pack: str = "", compname: str = "", engine=None) -> dict:
         search_query = name if name else query
         results, _ = self.searcher.search(search_query, pack=pack, compname=compname, top_k=8)
@@ -777,18 +700,15 @@ class FastMatcher:
         
         # Stage 1: Heuristic (fast, handles 85%+ correctly)
         heur_match, confidence = self.heuristic_match(query, candidates, name=name, compname=compname)
-        
-        if heur_match:
-            if confidence >= 95:
-                # HIGH confidence → accept directly
-                return heur_match
-            else:
-                # MEDIUM confidence → ask AI to verify
-                print(f"[AI Verify] Heuristic matched '{query}' → '{heur_match['name']}' (confidence={confidence}%). Verifying with AI...")
-                if self.ai_verify(query, heur_match, name=name, compname=compname, engine=engine):
-                    return heur_match
-                else:
-                    print(f"[AI Verify] Rejected: '{heur_match['name']}' is NOT the same as '{query}'")
+
+        if heur_match and confidence >= 95:
+            # HIGH confidence → accept directly
+            return heur_match
+
+        # Medium/no-confidence heuristic matches go straight to AI fallback.
+        # (AI Verify used to run first here, but it rejected ~99% of medium-
+        # confidence matches and fallback re-checks the same candidate anyway
+        # with a stricter, guardrail-backed prompt — verify was pure overhead.)
 
         # Stage 2: AI fallback (slow but accurate for edge cases)
         if candidates:
@@ -1095,11 +1015,13 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        # Native llama-server (port 8000) runs with --parallel 32 — pool slots are
-        # lightweight HTTP clients (VLLMEngine), no local CUDA context per slot, so
-        # the old per-process cap (needed only to limit local-model CUDA contexts)
-        # no longer applies. Sized to match the server's parallel-slot capacity.
-        pool_size = 32
+        # The backend now fires chunks concurrently, so all 10 gunicorn worker
+        # processes handle a chunk at once (instead of 1 process getting
+        # everything sequentially). Pool slots are lightweight HTTP clients
+        # (VLLMEngine, no local CUDA context), so the only thing to balance is
+        # not oversubscribing the native llama-server's --parallel 32 slots:
+        # 10 processes x 4 slots = 40 concurrent requests, close to capacity.
+        pool_size = 4
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
