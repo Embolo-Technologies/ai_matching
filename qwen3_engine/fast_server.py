@@ -1015,13 +1015,12 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        # The backend now fires chunks concurrently, so all 10 gunicorn worker
-        # processes handle a chunk at once (instead of 1 process getting
-        # everything sequentially). Pool slots are lightweight HTTP clients
-        # (VLLMEngine, no local CUDA context), so the only thing to balance is
-        # not oversubscribing the native llama-server's --parallel 32 slots:
-        # 10 processes x 4 slots = 40 concurrent requests, close to capacity.
-        pool_size = 4
+        # NOTE: the backend still sends one giant sequential chunk per job
+        # (the concurrent-chunk-sending backend change was never deployed —
+        # reverted pending a safer rollout plan). With only one gunicorn
+        # process ever active per job, pool_size needs to match the native
+        # llama-server's full --parallel 32 capacity on its own.
+        pool_size = 32
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
