@@ -791,7 +791,8 @@ def _dispatch_self_split(data: dict, products: list):
         sub_payload["products"] = sub_products
         sub_payload["_internal_subchunk"] = True
         try:
-            resp = requests.post("http://127.0.0.1:8080/match", json=sub_payload, timeout=1800)
+            # 300s timeout: 150 items @ 5.8 items/sec = 26s processing + queue time
+            resp = requests.post("http://127.0.0.1:8080/match", json=sub_payload, timeout=300)
             resp.raise_for_status()
             result = resp.json()
         except Exception as exc:
@@ -804,7 +805,10 @@ def _dispatch_self_split(data: dict, products: list):
             _state["matched"]    = len(all_mappings)
 
     try:
-        with ThreadPoolExecutor(max_workers=len(sub_chunks)) as executor:
+        # Cap concurrency to 5 (not len(sub_chunks)=33) to avoid overwhelming
+        # the 10-worker pool. Process sub-chunks in controlled batches.
+        max_workers = min(5, len(sub_chunks))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             list(executor.map(_send_sub_chunk, sub_chunks))
     finally:
         _done_event.set()
