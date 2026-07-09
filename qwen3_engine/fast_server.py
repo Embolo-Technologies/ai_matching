@@ -1053,8 +1053,8 @@ def initialize_on_import():
             medicines = raw.get("catalog", [])
             print(f"[Startup] Received {len(medicines):,} master medicines from backend.")
         except Exception as e:
-            print(f"[Startup] ERROR: Failed to fetch catalog from backend: {e}")
-            sys.exit(1)
+            print(f"[Startup] WARN: Catalog fetch failed ({e}). Falling back to local CSV...")
+            backend_url = None  # Force fallback to local
 
         # Write to a temp CSV so FuzzySearcher can load it
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
