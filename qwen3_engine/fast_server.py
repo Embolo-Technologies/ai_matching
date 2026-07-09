@@ -1116,10 +1116,22 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        # Pool size = concurrent requests to llama-server. With --parallel 32,
-        # maximize GPU utilization by filling 30/32 slots (94%). Each pool slot
-        # is a lightweight HTTP client connection that sends ONE request at a time.
+        # Pool size = concurrent requests to llama-server. Each pool slot is a
+        # lightweight HTTP client connection (no local model weights), so size
+        # it to the server's actual concurrency limit (--parallel N) rather
+        # than a hardcoded guess — reading /props keeps this correct even if
+        # --parallel changes.
         pool_size = 30
+        try:
+            import requests as _rq
+            from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
+            _props_url = _base.rstrip("/").removesuffix("/v1") + "/props"
+            _slots = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
+            if _slots > 0:
+                pool_size = _slots
+        except Exception:
+            pass
+        print(f"[Startup] Sizing engine pool to {pool_size} workers (llama-server slots).")
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
