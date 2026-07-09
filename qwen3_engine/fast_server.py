@@ -805,9 +805,9 @@ def _dispatch_self_split(data: dict, products: list):
             _state["matched"]    = len(all_mappings)
 
     try:
-        # Cap concurrency to 5 (not len(sub_chunks)=33) to avoid overwhelming
-        # the 10-worker pool. Process sub-chunks in controlled batches.
-        max_workers = min(5, len(sub_chunks))
+        # Fire sub-chunks in waves matching gunicorn worker count (10) so every
+        # worker stays busy. Timeout (300s) ensures stuck requests fail fast.
+        max_workers = min(10, len(sub_chunks))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             list(executor.map(_send_sub_chunk, sub_chunks))
     finally:
