@@ -1223,6 +1223,19 @@ def main():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER, MODEL_REGISTRY, DEFAULT_MODEL
         pool_size = calculate_optimal_workers("gemma4_2b")
+        # Native llama-server mode: pool entries are lightweight HTTP clients,
+        # not local model instances — size the pool to the server's slot count
+        # so every GPU slot can stay busy. The VRAM formula above only applies
+        # when loading local instances.
+        try:
+            import requests as _rq
+            from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
+            _props_url = _base.rstrip("/").removesuffix("/v1") + "/props"
+            _slots = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
+            if _slots > 0:
+                pool_size = _slots
+        except Exception:
+            pass
         print(f"[Startup] Pre-loading engine pool: {pool_size} workers (n_ctx={N_CTX_MATCHER})...")
 
         # ── Pre-warm: read model file into OS RAM cache once ──
