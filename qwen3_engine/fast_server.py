@@ -6,6 +6,8 @@ import re
 import json
 import subprocess
 import queue
+import threading
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -722,6 +724,98 @@ class FastMatcher:
 _matcher = None
 _engine_pool = None   # pre-loaded at startup; None until ready
 
+# A single big batch landing on ONE gunicorn process can only use that
+# process's threads — and Python's GIL means those threads can't truly run
+# the CPU-bound heuristic matching in parallel. Splitting a large batch into
+# sub-chunks and firing them at our own /match endpoint lets gunicorn's
+# shared listen socket spread them across ALL worker processes instead,
+# giving genuine multi-core parallelism. Sub-chunk requests carry
+# "_internal_subchunk" so they're processed directly, not split again.
+SELF_SPLIT_THRESHOLD  = 150
+SELF_SPLIT_CHUNK_SIZE = 150
+
+
+def _dispatch_self_split(data: dict, products: list):
+    """Split a large batch across this server's own worker processes."""
+    backend_url   = (data.get("backend_url") or "").rstrip("/")
+    job_id        = (data.get("job_id") or "").strip()
+    signal_secret = (data.get("signal_secret") or "").strip()
+    progress_url  = (
+        f"{backend_url}/medicine-matching/admin/gpu-match/{job_id}/gpu-progress"
+        if backend_url and job_id and signal_secret else None
+    )
+
+    sub_chunks = [products[i:i + SELF_SPLIT_CHUNK_SIZE]
+                  for i in range(0, len(products), SELF_SPLIT_CHUNK_SIZE)]
+    total   = len(products)
+    t_start = time.time()
+
+    _state       = {"processed": 0, "matched": 0}
+    _done_event  = threading.Event()
+    counter_lock = threading.Lock()
+
+    def _http_push(processed, matched):
+        if not progress_url:
+            return
+        elapsed = time.time() - t_start
+        rate    = processed / elapsed if elapsed > 0 else 0
+        eta_s   = (total - processed) / rate if rate > 0 else 0
+        try:
+            requests.post(
+                progress_url,
+                json={
+                    "job_id": job_id, "secret": signal_secret,
+                    "processed": processed, "total": total, "matched": matched,
+                    "eta_seconds": round(eta_s, 1),
+                },
+                timeout=5,
+            )
+        except Exception as _e:
+            print(f"[Progress] HTTP push failed: {_e}")
+
+    def _reporter_thread():
+        INTERVAL = 30
+        while not _done_event.wait(INTERVAL):
+            _http_push(_state["processed"], _state["matched"])
+        _http_push(_state["processed"], _state["matched"])
+
+    reporter = threading.Thread(target=_reporter_thread, daemon=True)
+    reporter.start()
+
+    all_mappings  = []
+    all_unmatched = []
+    errors        = []
+
+    def _send_sub_chunk(sub_products):
+        sub_payload = dict(data)
+        sub_payload["products"] = sub_products
+        sub_payload["_internal_subchunk"] = True
+        try:
+            resp = requests.post("http://127.0.0.1:8080/match", json=sub_payload, timeout=1800)
+            resp.raise_for_status()
+            result = resp.json()
+        except Exception as exc:
+            errors.append(str(exc))
+            return
+        with counter_lock:
+            all_mappings.extend(result.get("mappings", []))
+            all_unmatched.extend(result.get("unmatched", []))
+            _state["processed"] += len(sub_products)
+            _state["matched"]    = len(all_mappings)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(sub_chunks)) as executor:
+            list(executor.map(_send_sub_chunk, sub_chunks))
+    finally:
+        _done_event.set()
+        reporter.join(timeout=10)
+
+    if errors:
+        print(f"[Self-Split] {len(errors)}/{len(sub_chunks)} sub-chunks failed: {errors[:3]}")
+
+    return jsonify({"mappings": all_mappings, "unmatched": all_unmatched})
+
+
 @app.route("/match", methods=["POST"])
 def match_item():
     data = request.get_json(silent=True) or {}
@@ -729,6 +823,9 @@ def match_item():
     if "products" in data:
         # ── Batch match mode ──────────────────────────────────────────────────
         products      = data.get("products", [])
+
+        if not data.get("_internal_subchunk") and len(products) > SELF_SPLIT_THRESHOLD:
+            return _dispatch_self_split(data, products)
 
         # Progress callback info (injected by backend)
         backend_url   = (data.get("backend_url") or "").rstrip("/")
@@ -753,8 +850,6 @@ def match_item():
             return jsonify({"error": "Server still initialising — pool not ready."}), 503
 
         temp_matcher = _matcher
-
-        import threading
 
         pool_size  = _engine_pool.size
         engine_pool = _engine_pool
@@ -1015,12 +1110,13 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        # NOTE: the backend still sends one giant sequential chunk per job
-        # (the concurrent-chunk-sending backend change was never deployed —
-        # reverted pending a safer rollout plan). With only one gunicorn
-        # process ever active per job, pool_size needs to match the native
-        # llama-server's full --parallel 32 capacity on its own.
-        pool_size = 32
+        # Large batches now self-split across all 10 gunicorn processes
+        # (see _dispatch_self_split), so multiple processes are active on a
+        # single job at once. Pool slots are lightweight HTTP clients — the
+        # only thing to balance is not oversubscribing the native
+        # llama-server's --parallel 32 slots: 10 processes x 4 = 40,
+        # close to its real capacity.
+        pool_size = 4
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
