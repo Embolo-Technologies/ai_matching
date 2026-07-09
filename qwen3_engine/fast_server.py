@@ -1116,13 +1116,11 @@ def initialize_on_import():
     def _preload_pool():
         global _engine_pool
         from qwen3_engine.config import N_CTX_MATCHER
-        # Large batches now self-split across all 10 gunicorn processes
-        # (see _dispatch_self_split), so multiple processes are active on a
-        # single job at once. Pool slots are lightweight HTTP clients — the
-        # only thing to balance is not oversubscribing the native
-        # llama-server's --parallel 32 slots: 10 processes x 4 = 40,
-        # close to its real capacity.
-        pool_size = 4
+        # Pool size = concurrent requests to llama-server. With --parallel 32,
+        # we want to use most of those slots. Set to 24 to fill ~75% of GPU
+        # capacity, leaving some headroom. Each pool slot is a lightweight
+        # HTTP client connection that sends ONE request at a time.
+        pool_size = 24
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
         _engine_pool = pool
