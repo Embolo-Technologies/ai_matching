@@ -1043,6 +1043,7 @@ def initialize_on_import():
     backend_url = os.environ.get("BACKEND_URL") or get_gce_metadata("backend_url")
     secret = os.environ.get("GPU_SIGNAL_SECRET") or get_gce_metadata("gpu_signal_secret")
 
+    catalog_loaded = False
     if backend_url and secret:
         import urllib.request as _req, json as _json, tempfile, csv
         catalog_url = f"{backend_url.rstrip('/')}/medicine-matching/admin/gpu-match/catalog?secret={secret}"
@@ -1052,34 +1053,35 @@ def initialize_on_import():
                 raw = _json.loads(resp.read())
             medicines = raw.get("catalog", [])
             print(f"[Startup] Received {len(medicines):,} master medicines from backend.")
+
+            # Write to a temp CSV so FuzzySearcher can load it
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+            try:
+                with open(tmp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                    fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for m in medicines:
+                        name_str = (m.get("name") or "").strip()
+                        writer.writerow({
+                            'code':     m.get("master_id") or m.get("code") or "",
+                            'name':     name_str,
+                            'Compname': (m.get("company") or "").strip(),
+                            'Pack':     (m.get("pack") or "").strip(),
+                            'strength': extract_strength(name_str),
+                        })
+                print(f"[Startup] Building FuzzySearcher index from {len(medicines):,} medicines...")
+                _searcher = FuzzySearcher(csv_path=tmp_path)
+                _searcher.load()
+                catalog_loaded = True
+            finally:
+                import os as _os
+                try: _os.unlink(tmp_path)
+                except Exception: pass
         except Exception as e:
             print(f"[Startup] WARN: Catalog fetch failed ({e}). Falling back to local CSV...")
-            backend_url = None  # Force fallback to local
 
-        # Write to a temp CSV so FuzzySearcher can load it
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
-        try:
-            with open(tmp_fd, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                fieldnames = ['code', 'name', 'Compname', 'Pack', 'strength']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                for m in medicines:
-                    name_str = (m.get("name") or "").strip()
-                    writer.writerow({
-                        'code':     m.get("master_id") or m.get("code") or "",
-                        'name':     name_str,
-                        'Compname': (m.get("company") or "").strip(),
-                        'Pack':     (m.get("pack") or "").strip(),
-                        'strength': extract_strength(name_str),
-                    })
-            print(f"[Startup] Building FuzzySearcher index from {len(medicines):,} medicines...")
-            _searcher = FuzzySearcher(csv_path=tmp_path)
-            _searcher.load()
-        finally:
-            import os as _os
-            try: _os.unlink(tmp_path)
-            except Exception: pass
-    else:
+    if not catalog_loaded:
         # Fallback to local CSV
         user_home = os.path.expanduser("~")
         candidate_paths = [
