@@ -26,6 +26,8 @@ class FuzzySearcher:
         self.name_corpus_tokens = []
         self._prefix_index = {}
         self._company_prefix_index = {}
+        self.company_to_indices = {}
+        self.unique_companies = []
         
         if not os.path.exists(self.csv_path):
             raise FileNotFoundError(f"Database CSV not found at: {self.csv_path}")
@@ -71,11 +73,18 @@ class FuzzySearcher:
                     self._prefix_index[key] = []
                 self._prefix_index[key].append(i)
 
-        # Build company name prefix index
+        # Build company name prefix index and lookup dictionary
         for i, item in enumerate(self.catalog):
             comp = item.get("compname", "")
             if comp:
                 comp_norm = self._normalize_text(comp)
+                
+                # Build company lookup
+                if comp_norm not in self.company_to_indices:
+                    self.company_to_indices[comp_norm] = []
+                self.company_to_indices[comp_norm].append(i)
+
+                # Build prefix index
                 words = comp_norm.split()
                 if words:
                     key = words[0][:3]
@@ -83,7 +92,8 @@ class FuzzySearcher:
                         self._company_prefix_index[key] = []
                     self._company_prefix_index[key].append(i)
 
-        print(f"[Searcher] Loaded {len(self.catalog):,} items in {time.time() - t0:.2f}s")
+        self.unique_companies = list(self.company_to_indices.keys())
+        print(f"[Searcher] Loaded {len(self.catalog):,} items and {len(self.unique_companies):,} companies in {time.time() - t0:.2f}s")
 
     def _normalize_text(self, text: str) -> str:
         text = text.lower()
@@ -229,54 +239,17 @@ class FuzzySearcher:
         
         return (front_matches, matched_count, -proximity, exactness, -len_diff)
 
-    def search(self, name: str, pack: str = "", compname: str = "", top_k: int = 5) -> Tuple[List[Dict], float]:
-        t0 = time.time()
-        if not self.is_loaded():
-            self.load()
-            
-        # Stage 1: Wide Retrieve using prefix index + rapidfuzz batch
-        query_norm = self._normalize_text(name)
-        if not query_norm:
-            return [], 0.0
-
-        query_words = query_norm.split()
-        candidate_indices = set()
-        
-        # Extract candidates for each word in the query to handle code prefixes (e.g. "RS-PNTOP")
-        for word in query_words:
-            # Skip pure numbers to avoid pulling too many unrelated items
-            if word.isdigit() or re.match(r'^\d+\.?\d*$', word):
-                continue
-                
-            prefix_key = word[:3]
-            
-            # 1. Exact match for prefix_key if it exists (instant O(1) retrieval)
-            if prefix_key in self._prefix_index:
-                candidate_indices.update(self._prefix_index[prefix_key])
-                
-            # 2. Fuzzy match prefix_key against prefix keys (handles typos)
-            similar_keys = process.extract(prefix_key, self._prefix_index.keys(), scorer=fuzz.ratio, limit=40, score_cutoff=60)
-            for key, score, _ in similar_keys:
-                candidate_indices.update(self._prefix_index[key])
-
-            # 3. Same for company prefix index
-            if self._company_prefix_index:
-                if prefix_key in self._company_prefix_index:
-                    candidate_indices.update(self._company_prefix_index[prefix_key])
-                    
-                similar_comp_keys = process.extract(prefix_key, self._company_prefix_index.keys(), scorer=fuzz.ratio, limit=40, score_cutoff=60)
-                for key, score, _ in similar_comp_keys:
-                    candidate_indices.update(self._company_prefix_index[key])
-
-            # Fallback: if prefix_key is short (less than 3 chars), do startswith matching
-            if len(prefix_key) < 3:
-                for key in self._prefix_index:
-                    if key.startswith(prefix_key):
-                        candidate_indices.update(self._prefix_index[key])
-                for key in self._company_prefix_index:
-                    if key.startswith(prefix_key):
-                        candidate_indices.update(self._company_prefix_index[key])
-
+    def _score_and_rank_candidates(
+        self,
+        name: str,
+        pack: str,
+        compname: str,
+        candidate_indices: set,
+        top_k: int,
+        query_norm: str,
+        query_words: List[str],
+        query_tokens: List[str]
+    ) -> List[Dict]:
         # Score only the candidate subset using pre-computed normalized names
         candidates = []
         for idx in candidate_indices:
@@ -289,7 +262,6 @@ class FuzzySearcher:
         candidates = sorted(candidates, key=lambda x: x[1], reverse=True)[:120]
 
         # Stage 2: Lexicographical Re-ranking (uses pre-computed tokens)
-        query_tokens = self._meili_tokenize(name)
         scored_candidates = []
 
         for item, stage1_score, idx in candidates:
@@ -376,6 +348,101 @@ class FuzzySearcher:
                 "pack_score": round(sc["pack_score"], 1),
                 "final_score": round(sc["final_score"], 1)
             })
+        return results
+
+    def search(self, name: str, pack: str = "", compname: str = "", top_k: int = 5) -> Tuple[List[Dict], float]:
+        t0 = time.time()
+        if not self.is_loaded():
+            self.load()
+            
+        # Stage 1: Wide Retrieve using prefix index + rapidfuzz batch
+        query_norm = self._normalize_text(name)
+        if not query_norm:
+            return [], 0.0
+
+        query_words = query_norm.split()
+        query_tokens = self._meili_tokenize(name)
+        candidate_indices = set()
+        
+        # Extract candidates for each word in the query to handle code prefixes (e.g. "RS-PNTOP")
+        for word in query_words:
+            # Skip pure numbers to avoid pulling too many unrelated items
+            if word.isdigit() or re.match(r'^\d+\.?\d*$', word):
+                continue
+                
+            prefix_key = word[:3]
+            
+            # 1. Exact match for prefix_key if it exists (instant O(1) retrieval)
+            if prefix_key in self._prefix_index:
+                candidate_indices.update(self._prefix_index[prefix_key])
+                
+            # 2. Fuzzy match prefix_key against prefix keys (handles typos)
+            similar_keys = process.extract(prefix_key, self._prefix_index.keys(), scorer=fuzz.ratio, limit=40, score_cutoff=60)
+            for key, score, _ in similar_keys:
+                candidate_indices.update(self._prefix_index[key])
+
+            # 3. Same for company prefix index
+            if self._company_prefix_index:
+                if prefix_key in self._company_prefix_index:
+                    candidate_indices.update(self._company_prefix_index[prefix_key])
+                    
+                similar_comp_keys = process.extract(prefix_key, self._company_prefix_index.keys(), scorer=fuzz.ratio, limit=40, score_cutoff=60)
+                for key, score, _ in similar_comp_keys:
+                    candidate_indices.update(self._company_prefix_index[key])
+
+            # Fallback: if prefix_key is short (less than 3 chars), do startswith matching
+            if len(prefix_key) < 3:
+                for key in self._prefix_index:
+                    if key.startswith(prefix_key):
+                        candidate_indices.update(self._prefix_index[key])
+                for key in self._company_prefix_index:
+                    if key.startswith(prefix_key):
+                        candidate_indices.update(self._company_prefix_index[key])
+
+        # Step 1: Match Company name first if provided by vendor
+        matched_company = None
+        if compname and compname.strip() and self.unique_companies:
+            q_comp_norm = self._normalize_text(compname)
+            # 1. Try exact lookup first (instant O(1))
+            if q_comp_norm in self.company_to_indices:
+                matched_company = q_comp_norm
+            else:
+                # 2. Try fast prefix/startswith checks
+                for comp in self.unique_companies:
+                    if comp.startswith(q_comp_norm) or q_comp_norm.startswith(comp):
+                        matched_company = comp
+                        break
+                # 3. Only fallback to fuzzy match if it's a typo
+                if not matched_company:
+                    best_match = process.extractOne(q_comp_norm, self.unique_companies, scorer=fuzz.ratio)
+                    if best_match and best_match[1] >= 85:
+                        matched_company = best_match[0]
+
+        # Step 2: Search with optional company filtering & fallback
+        if matched_company:
+            company_indices = set(self.company_to_indices[matched_company])
+            subset_indices = candidate_indices.intersection(company_indices)
+            
+            results = self._score_and_rank_candidates(
+                name=name, pack=pack, compname=compname,
+                candidate_indices=subset_indices, top_k=top_k,
+                query_norm=query_norm, query_words=query_words, query_tokens=query_tokens
+            )
+            
+            # Fallback if subset match is empty or has a low top score (indicating incorrect company or false positive subset)
+            if not results or results[0]["final_score"] < 75.0:
+                results = self._score_and_rank_candidates(
+                    name=name, pack=pack, compname=compname,
+                    candidate_indices=candidate_indices, top_k=top_k,
+                    query_norm=query_norm, query_words=query_words, query_tokens=query_tokens
+                )
+        else:
+            # Normal global search
+            results = self._score_and_rank_candidates(
+                name=name, pack=pack, compname=compname,
+                candidate_indices=candidate_indices, top_k=top_k,
+                query_norm=query_norm, query_words=query_words, query_tokens=query_tokens
+            )
             
         elapsed_ms = round((time.time() - t0) * 1000, 2)
         return results, elapsed_ms
