@@ -1131,6 +1131,19 @@ def initialize_on_import():
                 pool_size = _slots
         except Exception:
             pass
+        # Running under gunicorn with N worker PROCESSES: each process gets
+        # its own independent pool, so sizing every one to the full slot count
+        # oversubscribes llama-server by Nx (measured: 10 workers x 32 each =
+        # 320 connections fighting over 32 real slots -> timeouts, dropped
+        # items, throughput collapse). Divide the total capacity across
+        # workers instead so the combined pool size matches llama-server's
+        # real concurrency limit.
+        worker_count = int(os.environ.get("GUNICORN_WORKER_COUNT", "1") or "1")
+        if worker_count > 1:
+            divided = max(1, pool_size // worker_count)
+            print(f"[Startup] Gunicorn worker count={worker_count}: dividing pool "
+                  f"{pool_size} -> {divided} per worker ({divided * worker_count} total).")
+            pool_size = divided
         print(f"[Startup] Sizing engine pool to {pool_size} workers (llama-server slots).")
         pool = EnginePool(model_key="gemma4_2b", size=pool_size)
         pool.populate()
