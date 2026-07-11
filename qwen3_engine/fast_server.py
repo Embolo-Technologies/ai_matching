@@ -206,6 +206,67 @@ CORS(app)
 _searcher = None
 _llm_engines = {}   # Lazy-loaded AI engines for fallback: model_key -> Qwen3Engine
 
+# ─── Diagnostic timing accumulator (answers: where does the per-item time go?) ──
+_timing_lock = threading.Lock()
+_timing_stats = {
+    "n_total": 0, "n_llm": 0,
+    "search_ms_sum": 0.0, "heur_ms_sum": 0.0, "llm_ms_sum": 0.0,
+    "search_ms_max": 0.0, "llm_ms_max": 0.0,
+}
+_inflight_lock = threading.Lock()
+_inflight_count = 0
+_inflight_max = 0
+
+def _record_timing(search_ms, heur_ms, llm_ms, llm: bool):
+    with _timing_lock:
+        _timing_stats["n_total"] += 1
+        _timing_stats["search_ms_sum"] += search_ms
+        _timing_stats["heur_ms_sum"] += heur_ms
+        _timing_stats["search_ms_max"] = max(_timing_stats["search_ms_max"], search_ms)
+        if llm:
+            _timing_stats["n_llm"] += 1
+            _timing_stats["llm_ms_sum"] += llm_ms
+            _timing_stats["llm_ms_max"] = max(_timing_stats["llm_ms_max"], llm_ms)
+
+def _inflight_enter():
+    global _inflight_max
+    with _inflight_lock:
+        global _inflight_count
+        _inflight_count += 1
+        _inflight_max = max(_inflight_max, _inflight_count)
+
+def _inflight_exit():
+    with _inflight_lock:
+        global _inflight_count
+        _inflight_count -= 1
+
+@app.route("/timing", methods=["GET", "POST"])
+def timing_stats():
+    """GET: return accumulated per-item timing stats. POST: reset them."""
+    if request.method == "POST":
+        with _timing_lock:
+            for k in _timing_stats:
+                _timing_stats[k] = 0 if isinstance(_timing_stats[k], int) else 0.0
+        global _inflight_max
+        with _inflight_lock:
+            _inflight_max = 0
+        return jsonify({"reset": True})
+    with _timing_lock:
+        s = dict(_timing_stats)
+    n = max(1, s["n_total"])
+    n_llm = max(1, s["n_llm"])
+    return jsonify({
+        "n_total": s["n_total"],
+        "n_llm": s["n_llm"],
+        "llm_fraction": round(s["n_llm"] / n, 3),
+        "avg_search_ms": round(s["search_ms_sum"] / n, 2),
+        "max_search_ms": round(s["search_ms_max"], 2),
+        "avg_heur_ms": round(s["heur_ms_sum"] / n, 2),
+        "avg_llm_ms": round(s["llm_ms_sum"] / n_llm, 2) if s["n_llm"] else 0,
+        "max_llm_ms": round(s["llm_ms_max"], 2),
+        "max_concurrent_llm_calls": _inflight_max,
+    })
+
 def is_abbreviation(abbrev: str, full: str) -> bool:
     abbrev = abbrev.lower().strip()
     full = full.lower().strip()
@@ -674,6 +735,7 @@ class FastMatcher:
 
     def match(self, query: str, name: str = "", pack: str = "", compname: str = "", engine=None) -> dict:
         search_query = name if name else query
+        _t_search = time.time()
         results, _ = self.searcher.search(search_query, pack=pack, compname=compname, top_k=8)
 
         # Second-pass: if first search returned fewer than 4 results, retry with
@@ -689,6 +751,7 @@ class FastMatcher:
                         results.append(r)
                         seen.add(r["code"])
                 results = results[:8]
+        _search_ms = (time.time() - _t_search) * 1000.0
 
         candidates = []
         for r in results:
@@ -699,12 +762,15 @@ class FastMatcher:
                 "pack": r["pack"],
                 "strength": r["strength"],
             })
-        
+
         # Stage 1: Heuristic (fast, handles 85%+ correctly)
+        _t_heur = time.time()
         heur_match, confidence = self.heuristic_match(query, candidates, name=name, compname=compname)
+        _heur_ms = (time.time() - _t_heur) * 1000.0
 
         if heur_match and confidence >= 95:
             # HIGH confidence → accept directly
+            _record_timing(_search_ms, _heur_ms, 0.0, llm=False)
             return heur_match
 
         # Medium/no-confidence heuristic matches go straight to AI fallback.
@@ -715,10 +781,19 @@ class FastMatcher:
         # Stage 2: AI fallback (slow but accurate for edge cases)
         if candidates:
             print(f"[AI Fallback] Heuristic failed for '{query}'. Asking LLM...")
-            ai_match = self.llm_rerank(query, candidates, name=name, compname=compname, engine=engine)
+            _t_llm = time.time()
+            _inflight_enter()
+            try:
+                ai_match = self.llm_rerank(query, candidates, name=name, compname=compname, engine=engine)
+            finally:
+                _inflight_exit()
+            _llm_ms = (time.time() - _t_llm) * 1000.0
+            _record_timing(_search_ms, _heur_ms, _llm_ms, llm=True)
             if ai_match:
                 return ai_match
+            return None
 
+        _record_timing(_search_ms, _heur_ms, 0.0, llm=False)
         return None
 
 _matcher = None
