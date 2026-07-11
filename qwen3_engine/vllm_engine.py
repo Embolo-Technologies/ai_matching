@@ -56,10 +56,11 @@ class VLLMEngine:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            # Gemma 4 E2B is a thinking model: without this flag the entire
-            # max_tokens budget is spent inside reasoning_content and
-            # message.content comes back empty — every match then fails.
-            "chat_template_kwargs": {"enable_thinking": False},
+            # Production config: thinking enabled, paired with a larger
+            # max_tokens (150) so the reasoning has room to complete before
+            # hitting the budget — confirmed by the user as the currently
+            # correct, deliberately-chosen accuracy config on GCP.
+            "chat_template_kwargs": {"enable_thinking": True},
         }
         resp = _session.post(f"{self.base_url}/chat/completions", json=payload, timeout=30)
         resp.raise_for_status()

@@ -711,7 +711,7 @@ class FastMatcher:
             prompt += "\nResult:"
 
         engine.clear_history()
-        response = engine.generate(prompt, max_tokens=50, temperature=0.0).strip()
+        response = engine.generate(prompt, max_tokens=150, temperature=0.0).strip()
         print(f"[AI] LLM Output:\n{response}")
 
         try:
