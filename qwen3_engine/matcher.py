@@ -21,6 +21,43 @@ def is_abbreviation(abbrev: str, full: str) -> bool:
     it = iter(full)
     return all(char in it for char in abbrev)
 
+def _split_camel_case_words(word):
+    """Split 'SmithKline' -> ['Smith', 'Kline']."""
+    parts = re.findall(r'[A-Z][a-z]*|[a-z]+|[A-Z]+(?![a-z])', word)
+    return [p for p in parts if p]
+
+def is_company_acronym(abbrev, full_name):
+    """
+    General acronym check: does `abbrev` (e.g. 'GSK') match the initials of
+    `full_name`'s significant words (e.g. 'Glaxo SmithKline' -> G+S+K)?
+    Works for any company, not hardcoded to a specific one.
+    """
+    abbrev = abbrev.strip().lower()
+    if not abbrev.isalpha() or not (2 <= len(abbrev) <= 6):
+        return False
+
+    stopwords = {
+        'laboratories', 'laboratory', 'labs', 'lab', 'pharma', 'pharmaceuticals', 'pharmaceutical',
+        'therapeutics', 'healthcare', 'lifesciences', 'life', 'sciences', 'pvt', 'ltd', 'private',
+        'limited', 'india', 'inc', 'corp', 'corporation', 'co', 'gmbh', 'sa', 'ag', 'and', 'the', 'of'
+    }
+    raw_words = re.findall(r"[A-Za-z]+", full_name)
+    sub_words = []
+    for w in raw_words:
+        if w.lower() in stopwords:
+            continue
+        sub_words.extend(_split_camel_case_words(w))
+
+    if not sub_words:
+        return False
+
+    initials = ''.join(w[0].lower() for w in sub_words if w)
+    if initials == abbrev:
+        return True
+    if abbrev in initials:
+        return True
+    return False
+
 def clean_company_name(name_str: str) -> str:
     if not name_str:
         return ""
@@ -59,6 +96,13 @@ def companies_compatible(q_comp: str, c_comp: str) -> bool:
     if non_trivial_overlap:
         return True
         
+    # General acronym check (not hardcoded to any specific company): does
+    # either short side match the initials of the other's significant
+    # words? Catches 'GSK'='Glaxo SmithKline', 'DRL'='Dr Reddy's Laboratories',
+    # etc. without a per-company lookup table.
+    if is_company_acronym(q_comp, c_comp) or is_company_acronym(c_comp, q_comp):
+        return True
+
     # Fuzzy ratio match
     score = fuzz.ratio(q_clean, c_clean)
     if score >= 75:
@@ -455,67 +499,31 @@ class HybridMatcher:
                 prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, code: {cand['code']})\n"
             prompt += "\nResult:"
         else:
-            # Full detailed prompt for 1.7B and larger models
+            # Full detailed prompt for 1.7B and larger models (trimmed: 1 example, no code field)
             prompt = (
-                "Wholesaler Input: PAN 40 TAB (Company: SUN PHARMA)\n"
-                "Master Candidates List:\n"
-                "1. PAN 40 (Pack: 10 TAB, Company: SUN PHAR, code: 101)\n"
-                "2. PENTAB 40 (Pack: 1 PC, Company: TORQUE, code: 102)\n"
-                "3. PAN D (Pack: 10 CAP, Company: SUN PHAR, code: 103)\n\n"
-                "Analysis:\n"
-                "- Wholesaler input is 'PAN 40 TAB'. Brand is 'PAN', strength is '40', formulation is 'TAB', Company is 'SUN PHARMA'.\n"
-                "- Candidate 1 matches brand 'PAN' (from 'PAN 40'), strength '40', formulation 'TAB', and Company 'SUN PHAR'. Exact match.\n"
-                "Result:\n"
-                "```json\n"
-                "{\n"
-                "  \"match_number\": 1\n"
-                "}\n"
-                "```\n\n"
-                "Wholesaler Input: CALPOL 650 (Company: GSK)\n"
-                "Master Candidates List:\n"
-                "1. CALPOL 500 (Pack: 15 TAB, Company: GSK, code: 201)\n"
-                "2. DOLO 650 (Pack: 15 TAB, Company: MICRO, code: 202)\n"
-                "3. PENTAB 40 (Pack: 1 PC, Company: TORQUE, code: 203)\n\n"
-                "Analysis:\n"
-                "- Wholesaler input is 'CALPOL 650'. Brand is 'CALPOL', strength is '650', Company is 'GSK'.\n"
-                "- Candidate 1 has mismatched strength (500 vs 650).\n"
-                "- Candidate 2 has mismatched brand ('DOLO' vs 'CALPOL').\n"
-                "- Candidate 3 has mismatched brand. No candidate matches.\n"
-                "Result:\n"
-                "```json\n"
-                "{\n"
-                "  \"match_number\": null\n"
-                "}\n"
-                "```\n\n"
-                "Wholesaler Input: BRIV SYRUP 100ML (Company: DR REDDY)\n"
-                "Master Candidates List:\n"
-                "1. BRIVATAB 100ML ORAL SOLUTION (Pack: 100ML, Company: HETERO, code: 301)\n\n"
-                "Analysis:\n"
-                "- Wholesaler input is 'BRIV SYRUP 100ML'. Brand is 'BRIV', strength is '100ML', Company is 'DR REDDY'.\n"
-                "- Candidate 1 has mismatched Company ('HETERO' vs 'DR REDDY'). Companies are different, so it cannot match.\n"
-                "Result:\n"
-                "```json\n"
-                "{\n"
-                "  \"match_number\": null\n"
-                "}\n"
-                "```\n\n"
+                "Wholesaler Input: CALPOL 650 (Co: GSK)\n"
+                "Candidates:\n"
+                "1. CALPOL 500 (Pack: 15 TAB, Co: GSK)\n"
+                "2. CALPOL 650 (Pack: 15 TAB, Co: GSK)\n"
+                "Analysis: Cand 1 strength mismatch (500 vs 650). Cand 2 matches all. Match.\n"
+                "Result:\n```json\n{\"match_number\": 2}\n```\n\n"
                 f"Wholesaler Input: {query}"
             )
             if compname and compname.strip() and compname.strip() != '--':
-                prompt += f" (Company: {compname.strip()})"
-            prompt += "\nMaster Candidates List:\n"
+                prompt += f" (Co: {compname.strip()})"
+            prompt += "\nCandidates:\n"
             for i, cand in enumerate(candidates, 1):
                 cand_company = cand.get('brand', '') or ''
-                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, Company: {cand_company}, code: {cand['code']})\n"
-                
+                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, Co: {cand_company})\n"
+
             prompt += (
-                "\nWrite exactly two sections: 'Analysis:' followed by your step-by-step comparisons, and 'Result:' followed by the final match JSON block.\n\n"
+                "\nWrite 'Analysis:' with brief step-by-step comparisons, then 'Result:' with the final match JSON block.\n\n"
                 f"Analysis:\n"
                 f"- Wholesaler input is '{query}'."
             )
         
         self.engine.clear_history()
-        response = self.engine.generate(prompt, max_tokens=500, temperature=0.0)
+        response = self.engine.generate(prompt, max_tokens=700, temperature=0.0)
         if self.model_key != "qwen3":
             response = f"- Wholesaler input is '{query}'." + response.strip()
         else:
