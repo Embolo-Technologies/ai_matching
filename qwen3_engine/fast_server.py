@@ -68,15 +68,28 @@ class EnginePool:
         self.num_gpus = max(1, get_num_gpus())
 
     def populate(self):
+        import os as _os
         from qwen3_engine.vllm_engine import VLLMEngine
-        probe = VLLMEngine()
-        if probe.check_ready(timeout=2.0):
-            print(f"[EnginePool] llama_cpp.server detected on port 8000 — Using VLLMEngine for continuous batching.")
+        backend_urls = [u.strip() for u in _os.environ.get(
+            "LLAMA_BACKEND_URLS", "http://localhost:8000/v1"
+        ).split(",") if u.strip()]
+
+        ready_backends = []
+        for url in backend_urls:
+            probe = VLLMEngine(base_url=url)
+            if probe.check_ready(timeout=2.0):
+                ready_backends.append(url)
+                print(f"[EnginePool] llama_cpp.server detected at {url} — ready.")
+            else:
+                print(f"[EnginePool] WARNING: backend {url} not ready, skipping.")
+
+        if ready_backends:
             for i in range(self.size):
-                engine = VLLMEngine()
+                url = ready_backends[i % len(ready_backends)]
+                engine = VLLMEngine(base_url=url)
                 engine._ready = True
                 self.pool.put(engine)
-            print(f"[EnginePool] ✓ {self.size} workers wired to llama_cpp.server.")
+            print(f"[EnginePool] ✓ {self.size} workers wired across {len(ready_backends)} backend(s): {ready_backends}")
             return
 
         from qwen3_engine.engine import Qwen3Engine
@@ -89,7 +102,7 @@ class EnginePool:
             engine.load(n_ctx=N_CTX_MATCHER, num_gpus=self.num_gpus)
             self.pool.put(engine)
             print(f"  ✓ Worker {i+1}/{self.size} on GPU {gpu_id} ready in {time.time()-t0:.1f}s")
-            
+
     def lease(self):
         return self.pool.get()
         
@@ -167,6 +180,43 @@ def clean_company_name(name_str: str) -> str:
         cleaned_words = words
     return " ".join(cleaned_words).strip()
 
+def _split_camel_case_words(word):
+    """Split 'SmithKline' -> ['Smith', 'Kline']."""
+    parts = re.findall(r'[A-Z][a-z]*|[a-z]+|[A-Z]+(?![a-z])', word)
+    return [p for p in parts if p]
+
+def is_company_acronym(abbrev, full_name):
+    """
+    General acronym check: does `abbrev` (e.g. 'GSK') match the initials of
+    `full_name`'s significant words (e.g. 'Glaxo SmithKline' -> G+S+K)?
+    Works for any company, not hardcoded to a specific one.
+    """
+    abbrev = abbrev.strip().lower()
+    if not abbrev.isalpha() or not (2 <= len(abbrev) <= 6):
+        return False
+
+    stopwords = {
+        'laboratories', 'laboratory', 'labs', 'lab', 'pharma', 'pharmaceuticals', 'pharmaceutical',
+        'therapeutics', 'healthcare', 'lifesciences', 'life', 'sciences', 'pvt', 'ltd', 'private',
+        'limited', 'india', 'inc', 'corp', 'corporation', 'co', 'gmbh', 'sa', 'ag', 'and', 'the', 'of'
+    }
+    raw_words = re.findall(r"[A-Za-z]+", full_name)
+    sub_words = []
+    for w in raw_words:
+        if w.lower() in stopwords:
+            continue
+        sub_words.extend(_split_camel_case_words(w))
+
+    if not sub_words:
+        return False
+
+    initials = ''.join(w[0].lower() for w in sub_words if w)
+    if initials == abbrev:
+        return True
+    if abbrev in initials:
+        return True
+    return False
+
 def companies_compatible(q_comp: str, c_comp: str) -> bool:
     q_clean = clean_company_name(q_comp)
     c_clean = clean_company_name(c_comp)
@@ -185,6 +235,11 @@ def companies_compatible(q_comp: str, c_comp: str) -> bool:
     if non_trivial_overlap:
         return True
         
+    # General acronym check: does either short side match the initials
+    # of the other's significant words? Catches 'GSK'='Glaxo SmithKline' etc.
+    if is_company_acronym(q_comp, c_comp) or is_company_acronym(c_comp, q_comp):
+        return True
+
     # Fuzzy ratio match
     score = fuzz.ratio(q_clean, c_clean)
     if score >= 75:
@@ -413,7 +468,7 @@ class FastMatcher:
             'd', 'dsr', 'sr', 'xr', 'er', 'cr', 'mr', 'xl', 'la', 'plus', 'xt', 'tz', 'oz', 'h', 'at', 'am', 'lp', 'sp', 
             'ap', 'force', 'forte', 'fort', 'pd', 'kid', 'dc', 'as', 'sl', 'dt', 'ct', 'rt', 'mps', 'df', 'dx', 'ds', 
             'cv', 'lb', 'xp', 'f', 'e', 'k2', 'gold', 'mb', 'hs', 'at', 'aa', 'pr', 'od', 'fb', 'l', 'ax', 'snq', 'dp', 
-            'th', 'pg', 'nt', 'm', 'beta', 'tri', 'ch', 'ln', 't', 'o', 'av', 'd3'
+            'th', 'pg', 'nt', 'm', 'beta', 'tri', 'ch', 'ln', 't', 'o', 'av', 'd3', 'p', 'rapid'
         }
         
         def get_suffixes(text: str) -> set:
@@ -668,50 +723,36 @@ class FastMatcher:
                 prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, code: {cand['code']})\n"
             prompt += "\nResult:"
         else:
-            # Full detailed prompt for 1.7B and larger models, but without analysis output
+            # Trimmed chain-of-thought (matches validated matcher.py version):
+            # 1 example, no 'code' field shown to the model (code isn't needed
+            # for its decision — only used internally via list position).
             prompt = (
-                # Example 1: Correct match
-                "Wholesaler Input: PAN 40 TAB (Company: SUN PHARMA)\n"
-                "Master Candidates List:\n"
-                "1. PAN 40 (Pack: 10 TAB, Company: SUN PHAR, code: 101)\n"
-                "2. PENTAB 40 (Pack: 1 PC, Company: TORQUE, code: 102)\n"
-                "Result:\n"
-                '```json\n{"match_number": 1}\n```\n\n'
-                # Example 2: Strength mismatch → null
-                "Wholesaler Input: CALPOL 650 (Company: GSK)\n"
-                "Master Candidates List:\n"
-                "1. CALPOL 500 (Pack: 15 TAB, Company: GSK, code: 201)\n"
-                "2. DOLO 650 (Pack: 15 TAB, Company: MICRO, code: 202)\n"
-                "Result:\n"
-                '```json\n{"match_number": null}\n```\n\n'
-                # Example 3: Formulation mismatch → null
-                "Wholesaler Input: PAN 40 INJ (Company: SUN PHARMA)\n"
-                "Master Candidates List:\n"
-                "1. PAN 40 (Pack: 10 TAB, Company: SUN PHAR, code: 301)\n"
-                "2. PAN D (Pack: 10 CAP, Company: SUN PHAR, code: 302)\n"
-                "Result:\n"
-                '```json\n{"match_number": null}\n```\n\n'
-                # Example 4: Oral Pack matching (abbreviation compatibility)
-                "Wholesaler Input: LIOFEN 10MG 10TAB (Company: INTAS)\n"
-                "Master Candidates List:\n"
-                "1. LIOFEN 10 (Pack: S10, Company: INTAS, code: M_3218)\n"
-                "2. LIOFEN LIQUID (Pack: BL1, Company: INTAS, code: M_16166)\n"
-                "Result:\n"
-                '```json\n{"match_number": 1}\n```\n\n'
-                # Now the real query
+                "Wholesaler Input: CALPOL 650 (Co: GSK)\n"
+                "Candidates:\n"
+                "1. CALPOL 500 (Pack: 15 TAB, Co: GSK)\n"
+                "2. CALPOL 650 (Pack: 15 TAB, Co: GSK)\n"
+                "Analysis: Cand 1 strength mismatch (500 vs 650). Cand 2 matches all. Match.\n"
+                "Result:\n```json\n{\"match_number\": 2}\n```\n\n"
                 f"Wholesaler Input: {query}"
             )
             if compname and compname.strip() and compname.strip() != '--':
-                prompt += f" (Company: {compname.strip()})"
-            prompt += "\nMaster Candidates List:\n"
+                prompt += f" (Co: {compname.strip()})"
+            prompt += "\nCandidates:\n"
             for i, cand in enumerate(candidates, 1):
                 cand_company = cand.get('brand', '') or ''
-                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, Company: {cand_company}, code: {cand['code']})\n"
+                prompt += f"{i}. {cand['name']} (Pack: {cand['pack']}, Co: {cand_company})\n"
 
-            prompt += "\nResult:"
-
+            prompt += (
+                "\nWrite 'Analysis:' with brief step-by-step comparisons, then 'Result:' with the final match JSON block.\n\n"
+                f"Analysis:\n"
+                f"- Wholesaler input is '{query}'."
+            )
         engine.clear_history()
-        response = engine.generate(prompt, max_tokens=50, temperature=0.0).strip()
+        raw_response = engine.generate(prompt, max_tokens=700, temperature=0.0)
+        if self.model_key != "qwen3":
+            response = f"- Wholesaler input is '{query}'." + raw_response.strip()
+        else:
+            response = raw_response.strip()
         print(f"[AI] LLM Output:\n{response}")
 
         try:
@@ -736,7 +777,7 @@ class FastMatcher:
     def match(self, query: str, name: str = "", pack: str = "", compname: str = "", engine=None) -> dict:
         search_query = name if name else query
         _t_search = time.time()
-        results, _ = self.searcher.search(search_query, pack=pack, compname=compname, top_k=8)
+        results, _ = self.searcher.search(search_query, pack=pack, compname=compname, top_k=5)
 
         # Second-pass: if first search returned fewer than 4 results, retry with
         # just the first substantive word (catches abbreviations like "AMC" → "AMOXICLAV")
@@ -744,7 +785,7 @@ class FastMatcher:
             words = [w for w in re.sub(r'[^a-zA-Z0-9\s]', ' ', search_query).split()
                      if len(w) >= 3 and not w.isdigit()]
             if words:
-                extra, _ = self.searcher.search(words[0], pack=pack, compname=compname, top_k=8)
+                extra, _ = self.searcher.search(words[0], pack=pack, compname=compname, top_k=5)
                 seen = {r["code"] for r in results}
                 for r in extra:
                     if r["code"] not in seen:
@@ -990,55 +1031,66 @@ def match_item():
             prod_comp = prod.get("company", "").strip()
             prod_code = prod.get("code", "").strip()
 
-            engine = engine_pool.lease()
             try:
-                res_match = temp_matcher.match(
-                    f"{prod_name} {prod_pack}".strip(),
-                    name=prod_name, pack=prod_pack, compname=prod_comp,
-                    engine=engine
-                )
-            finally:
-                engine_pool.release(engine)
+                engine = engine_pool.lease()
+                try:
+                    res_match = temp_matcher.match(
+                        f"{prod_name} {prod_pack}".strip(),
+                        name=prod_name, pack=prod_pack, compname=prod_comp,
+                        engine=engine
+                    )
+                finally:
+                    engine_pool.release(engine)
 
-            if res_match:
-                conf = compute_confidence(
-                    prod_name,
-                    res_match['name'],
-                    res_match.get('brand', ''),
-                    prod_pack,
-                    res_match.get('pack', '')
-                )
-                mappings.append({
-                    "vendor_code":      prod_code,
-                    "master_id":        res_match["code"],
-                    "product_name":     prod_name,
-                    "company":          prod_comp,
-                    "pack":             prod_pack,
-                    "matched_name":     res_match["name"],
-                    "matched_pack":     res_match.get("pack", ""),
-                    "matched_company":  res_match.get("brand", ""),
-                    "source":           "gpu_ai",
-                    "confidence":       float(conf)
-                })
-            else:
-                cand_results, _ = _searcher.search(
-                    f"{prod_name} {prod_pack}".strip(), pack=prod_pack, compname=prod_comp, top_k=5
-                )
+                if res_match:
+                    conf = compute_confidence(
+                        prod_name,
+                        res_match['name'],
+                        res_match.get('brand', ''),
+                        prod_pack,
+                        res_match.get('pack', '')
+                    )
+                    mappings.append({
+                        "vendor_code":      prod_code,
+                        "master_id":        res_match["code"],
+                        "product_name":     prod_name,
+                        "company":          prod_comp,
+                        "pack":             prod_pack,
+                        "matched_name":     res_match["name"],
+                        "matched_pack":     res_match.get("pack", ""),
+                        "matched_company":  res_match.get("brand", ""),
+                        "source":           "gpu_ai",
+                        "confidence":       float(conf)
+                    })
+                else:
+                    cand_results, _ = _searcher.search(
+                        f"{prod_name} {prod_pack}".strip(), pack=prod_pack, compname=prod_comp, top_k=5
+                    )
+                    unmatched.append({
+                        "vendor_code":  prod_code,
+                        "product_name": prod_name,
+                        "company":      prod_comp,
+                        "pack":         prod_pack,
+                        "candidates": [
+                            {
+                                "master_id": r["code"],
+                                "name": r["name"],
+                                "company": r.get("compname", ""),
+                                "pack": r.get("pack", ""),
+                                "score": r.get("final_score", 0),
+                            }
+                            for r in cand_results
+                        ],
+                    })
+            except Exception as _proc_exc:
+                print(f"[ProcessError] '{prod_name} {prod_pack}': {type(_proc_exc).__name__}: {_proc_exc}")
                 unmatched.append({
                     "vendor_code":  prod_code,
                     "product_name": prod_name,
                     "company":      prod_comp,
                     "pack":         prod_pack,
-                    "candidates": [
-                        {
-                            "master_id": r["code"],
-                            "name": r["name"],
-                            "company": r.get("compname", ""),
-                            "pack": r.get("pack", ""),
-                            "score": r.get("final_score", 0),
-                        }
-                        for r in cand_results
-                    ],
+                    "candidates": [],
+                    "error": f"{type(_proc_exc).__name__}: {_proc_exc}",
                 })
 
             with counter_lock:
@@ -1198,12 +1250,19 @@ def initialize_on_import():
         # --parallel changes.
         pool_size = 30
         try:
-            import requests as _rq
+            import os as _os2, requests as _rq
             from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
-            _props_url = _base.rstrip("/").removesuffix("/v1") + "/props"
-            _slots = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
-            if _slots > 0:
-                pool_size = _slots
+            _urls = [u.strip() for u in _os2.environ.get("LLAMA_BACKEND_URLS", _base).split(",") if u.strip()]
+            _total_slots = 0
+            for _u in _urls:
+                _props_url = _u.rstrip("/").removesuffix("/v1") + "/props"
+                try:
+                    _s = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
+                    _total_slots += _s
+                except Exception:
+                    pass
+            if _total_slots > 0:
+                pool_size = _total_slots
         except Exception:
             pass
         # Running under gunicorn with N worker PROCESSES: each process gets
@@ -1328,12 +1387,19 @@ def main():
         # so every GPU slot can stay busy. The VRAM formula above only applies
         # when loading local instances.
         try:
-            import requests as _rq
+            import os as _os2, requests as _rq
             from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
-            _props_url = _base.rstrip("/").removesuffix("/v1") + "/props"
-            _slots = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
-            if _slots > 0:
-                pool_size = _slots
+            _urls = [u.strip() for u in _os2.environ.get("LLAMA_BACKEND_URLS", _base).split(",") if u.strip()]
+            _total_slots = 0
+            for _u in _urls:
+                _props_url = _u.rstrip("/").removesuffix("/v1") + "/props"
+                try:
+                    _s = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
+                    _total_slots += _s
+                except Exception:
+                    pass
+            if _total_slots > 0:
+                pool_size = _total_slots
         except Exception:
             pass
         print(f"[Startup] Pre-loading engine pool: {pool_size} workers (n_ctx={N_CTX_MATCHER})...")
