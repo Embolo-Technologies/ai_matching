@@ -61,7 +61,7 @@ class VLLMEngine:
             # message.content comes back empty — every match then fails.
             "chat_template_kwargs": {"enable_thinking": False},
         }
-        resp = _session.post(f"{self.base_url}/chat/completions", json=payload, timeout=30)
+        resp = _session.post(f"{self.base_url}/chat/completions", json=payload, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
