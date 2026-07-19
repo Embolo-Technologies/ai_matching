@@ -1239,52 +1239,70 @@ def initialize_on_import():
     _matcher = FastMatcher(_searcher)
     _matcher.load_catalog()
 
-    # Pre-load engine pool in background so health returns 503 until ready
-    def _preload_pool():
-        global _engine_pool
-        from qwen3_engine.config import N_CTX_MATCHER
-        # Pool size = concurrent requests to llama-server. Each pool slot is a
-        # lightweight HTTP client connection (no local model weights), so size
-        # it to the server's actual concurrency limit (--parallel N) rather
-        # than a hardcoded guess — reading /props keeps this correct even if
-        # --parallel changes.
-        pool_size = 30
-        try:
-            import os as _os2, requests as _rq
-            from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
-            _urls = [u.strip() for u in _os2.environ.get("LLAMA_BACKEND_URLS", _base).split(",") if u.strip()]
-            _total_slots = 0
-            for _u in _urls:
-                _props_url = _u.rstrip("/").removesuffix("/v1") + "/props"
-                try:
-                    _s = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
-                    _total_slots += _s
-                except Exception:
-                    pass
-            if _total_slots > 0:
-                pool_size = _total_slots
-        except Exception:
-            pass
-        # Running under gunicorn with N worker PROCESSES: each process gets
-        # its own independent pool, so sizing every one to the full slot count
-        # oversubscribes llama-server by Nx (measured: 10 workers x 32 each =
-        # 320 connections fighting over 32 real slots -> timeouts, dropped
-        # items, throughput collapse). Divide the total capacity across
-        # workers instead so the combined pool size matches llama-server's
-        # real concurrency limit.
-        worker_count = int(os.environ.get("GUNICORN_WORKER_COUNT", "1") or "1")
-        if worker_count > 1:
-            divided = max(1, pool_size // worker_count)
-            print(f"[Startup] Gunicorn worker count={worker_count}: dividing pool "
-                  f"{pool_size} -> {divided} per worker ({divided * worker_count} total).")
-            pool_size = divided
-        print(f"[Startup] Sizing engine pool to {pool_size} workers (llama-server slots).")
-        pool = EnginePool(model_key="gemma4_2b", size=pool_size)
-        pool.populate()
-        _engine_pool = pool
+    # Under gunicorn --preload the app (and this catalog load) runs ONCE in
+    # the master before forking, so all workers inherit it via copy-on-write
+    # instead of each of the N workers redundantly re-fetching/re-indexing
+    # the full catalog themselves — that redundant work was the dominant
+    # cost in pod boot time. The engine pool holds live HTTP connections to
+    # llama-server though — those don't survive being copied into a forked
+    # child — so it must be created AFTER fork, once per worker.
+    # FAST_SERVER_DEFER_POOL_INIT=1 signals that a gunicorn `post_fork` hook
+    # (see qwen3_engine/gunicorn_conf.py) will call
+    # init_engine_pool_for_worker() itself instead of doing it here.
+    if os.environ.get("FAST_SERVER_DEFER_POOL_INIT") != "1":
+        import threading as _threading
+        _threading.Thread(target=init_engine_pool_for_worker, daemon=True).start()
 
-    import threading as _threading
-    _threading.Thread(target=_preload_pool, daemon=True).start()
+def init_engine_pool_for_worker():
+    """
+    Creates and populates this process's EnginePool. Must run once per
+    gunicorn worker AFTER fork — the pool holds live HTTP connections to
+    llama-server, which do not survive being copied into a forked child.
+    Runs automatically at import when not deferred (see initialize_on_import
+    above), or via a gunicorn `post_fork` hook when FAST_SERVER_DEFER_POOL_INIT
+    is set (see qwen3_engine/gunicorn_conf.py).
+    """
+    global _engine_pool
+    from qwen3_engine.config import N_CTX_MATCHER
+    # Pool size = concurrent requests to llama-server. Each pool slot is a
+    # lightweight HTTP client connection (no local model weights), so size
+    # it to the server's actual concurrency limit (--parallel N) rather
+    # than a hardcoded guess — reading /props keeps this correct even if
+    # --parallel changes.
+    pool_size = 30
+    try:
+        import os as _os2, requests as _rq
+        from qwen3_engine.config import LLAMA_SERVER_BASE_URL as _base
+        _urls = [u.strip() for u in _os2.environ.get("LLAMA_BACKEND_URLS", _base).split(",") if u.strip()]
+        _total_slots = 0
+        for _u in _urls:
+            _props_url = _u.rstrip("/").removesuffix("/v1") + "/props"
+            try:
+                _s = int(_rq.get(_props_url, timeout=3).json().get("total_slots") or 0)
+                _total_slots += _s
+            except Exception:
+                pass
+        if _total_slots > 0:
+            pool_size = _total_slots
+    except Exception:
+        pass
+    # Running under gunicorn with N worker PROCESSES: each process gets
+    # its own independent pool, so sizing every one to the full slot count
+    # oversubscribes llama-server by Nx (measured: 10 workers x 32 each =
+    # 320 connections fighting over 32 real slots -> timeouts, dropped
+    # items, throughput collapse). Divide the total capacity across
+    # workers instead so the combined pool size matches llama-server's
+    # real concurrency limit.
+    worker_count = int(os.environ.get("GUNICORN_WORKER_COUNT", "1") or "1")
+    if worker_count > 1:
+        divided = max(1, pool_size // worker_count)
+        print(f"[Startup] Gunicorn worker count={worker_count}: dividing pool "
+              f"{pool_size} -> {divided} per worker ({divided * worker_count} total).")
+        pool_size = divided
+    print(f"[Startup] Sizing engine pool to {pool_size} workers (llama-server slots).")
+    pool = EnginePool(model_key="gemma4_2b", size=pool_size)
+    pool.populate()
+    _engine_pool = pool
 
 # Initialize automatically on import if NOT running via CLI command-line tool with arguments
 import sys
