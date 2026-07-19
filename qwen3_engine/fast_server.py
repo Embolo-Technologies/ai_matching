@@ -1026,10 +1026,18 @@ def match_item():
         reporter.start()
 
         def process_product(prod):
-            prod_name = prod.get("name", "").strip()
-            prod_pack = prod.get("pack", "").strip()
-            prod_comp = prod.get("company", "").strip()
-            prod_code = prod.get("code", "").strip()
+            # .get(key, "") only falls back to "" when the key is ABSENT — a
+            # vendor payload with an explicit JSON null (present key, None
+            # value) makes .get() return None, and .strip() on that raises
+            # AttributeError here, outside the try/except below. Since this
+            # ran under executor.map() whose result was never consumed, that
+            # exception was silently swallowed by ThreadPoolExecutor — no
+            # log, no error field, the whole request just hung/failed with
+            # no useful message once enough of the batch found a null field.
+            prod_name = (prod.get("name") or "").strip()
+            prod_pack = (prod.get("pack") or "").strip()
+            prod_comp = (prod.get("company") or "").strip()
+            prod_code = (prod.get("code") or "").strip()
 
             try:
                 engine = engine_pool.lease()
@@ -1098,9 +1106,14 @@ def match_item():
                 _state["matched"]    = len(mappings)
 
         # ── Main matching loop (Parallel ThreadPoolExecutor) ──────────────
+        # executor.map()'s return value must be consumed (list(...)) — its
+        # iterator is where per-item exceptions actually get raised. Left
+        # unconsumed, any exception process_product() doesn't itself catch
+        # is silently discarded with no log and no error surfaced anywhere,
+        # which is exactly what made this class of bug so hard to diagnose.
         try:
             with ThreadPoolExecutor(max_workers=pool_size) as executor:
-                executor.map(process_product, products)
+                list(executor.map(process_product, products))
         finally:
             _done_event.set()
             reporter.join(timeout=10)
